@@ -1,0 +1,35 @@
+# Application dependencies. Third-party scanner dependencies are installed in
+# isolated environments by setup.py so they cannot conflict with the web app.
+Flask==3.1.3
+arjun==2.2.7
+sslyze==6.3.1
+dnsrecon==0.10.1
+
+# Required system binaries (install through apt, Go, Snap, or their upstream
+# release packages; these are NOT Python/PyPI packages):
+#   ducky-subs  - subdomain enumeration
+#   dnsx        - DNS resolution
+#   naabu       - port discovery
+#   nmap        - service fingerprinting
+#   httpx       - HTTP probing (ProjectDiscovery version)
+#   katana      - web and JavaScript crawling
+#   gau         - archived URL discovery
+#   waybackurls - Wayback Machine URL discovery
+#   whatweb     - supplemental technology detection
+#   whois, dig  - registration and DNS records
+#   sslscan     - supplemental TLS checks
+#   nikto       - bounded web-server checks
+#   dnsenum     - optional supplemental DNS enumeration
+#
+# Required only by the deep profile:
+#   nuclei      - template-based security observations
+#   ffuf        - recursive content discovery
+#   dalfox      - XSS analysis
+#   SecLists    - wordlists, normally under /usr/share/wordlists/SecLists
+#   tools/XSStrike and tools/sqlmap are vendored Python applications.
+#   tools/bin contains locally built Gitleaks, TruffleHog and SubOver.
+#   tools/bin/mantra supplements JavaScript and HTML secret detection.
+#   tools/testssl.sh and tools/theHarvester are isolated vendored tools.
+#
+# Optional functionality:
+#   A Chromium/Chrome installation is needed only when --screenshots is used.

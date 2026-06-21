@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block title %}Sign in · Recon Console{% endblock %}{% block shell_class %}login-shell{% endblock %}
+{% block content %}
+<section class="login-card">
+  <div class="mark">R</div><p class="eyebrow">AUTHORIZED TESTING</p><h1>Recon Console</h1>
+  <p class="muted">Sign in to manage targets and review scan intelligence.</p>
+  <form method="post" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next }}">
+    <label>Username<input name="username" autocomplete="username" required autofocus></label>
+    <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <button class="primary">Sign in</button>
+  </form>
+</section>
+{% endblock %}

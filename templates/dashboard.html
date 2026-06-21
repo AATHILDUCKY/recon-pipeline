@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block content %}
+<section class="hero"><div><p class="eyebrow">CONTROL CENTER</p><h1>Attack-surface dashboard</h1><p class="muted">Queue authorized targets. The worker handles them safely in the background.</p></div><div class="live"><i></i> Worker online</div></section>
+<section class="stats">
+  <article><strong>{{ targets|length }}</strong><span>Targets</span></article><article><strong>{{ totals.get('running',0) }}</strong><span>Running</span></article>
+  <article><strong>{{ totals.get('queued',0) }}</strong><span>Queued</span></article><article><strong>{{ totals.get('complete',0) }}</strong><span>Completed scans</span></article>
+</section>
+<section class="panel"><div class="panel-head"><div><h2>Add targets</h2><p>One hostname per line, or separate them with spaces or commas.</p></div></div>
+  <form action="{{ url_for('add_targets') }}" method="post" class="target-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <textarea name="targets" rows="3" placeholder="example.com&#10;api.example.org" required></textarea>
+    <div class="form-row"><label>Scan profile<select name="profile"><option value="passive">Passive</option><option value="standard" selected>Standard</option><option value="deep">Deep</option></select></label>
+      <label class="check"><input type="checkbox" name="authorized" value="yes" required> I confirm written authorization for every target</label><button class="primary">Add and scan</button></div>
+  </form>
+</section>
+<section class="panel"><div class="panel-head"><div><h2>Targets</h2><p>Open a target to inspect endpoints, findings, DNS, ports, and tool execution.</p></div></div>
+  {% if targets %}<div class="target-list">
+  {% for target in targets %}<a class="target-row" href="{{ url_for('target_detail', target_id=target.id) }}">
+    <div class="target-icon">{{ target.domain[0]|upper }}</div><div class="grow"><strong>{{ target.domain }}</strong><span>Added {{ target.created_at }} · {{ target.profile or 'not scanned' }}</span></div>
+    {% if target.status %}<span class="status {{ target.status }}">{{ target.status }}</span>{% endif %}<span class="arrow">›</span>
+  </a>{% endfor %}</div>{% else %}<div class="empty">No targets yet. Add the first authorized scope above.</div>{% endif %}
+</section>
+{% endblock %}

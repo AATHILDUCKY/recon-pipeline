@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent
 TOOLS = ROOT / "tools"
 BIN = TOOLS / "bin"
 VENV = ROOT / "venv"
+WORDLISTS = TOOLS / "wordlists"
 
 # Revisions tested with Recon Pipeline 2.0. Updating is an explicit operation.
 REPOSITORIES = {
@@ -54,6 +55,10 @@ GO_TOOLS = {
 OS_COMMANDS = ("git", "go", "nmap", "whatweb", "whois", "dig", "sslscan", "nikto", "perl")
 STAMP_NAME = ".recon-pipeline-install.json"
 SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra", "trufflehog": "trufflehog"}
+WORDLIST_REPOSITORIES = {
+    "SecLists": "https://github.com/danielmiessler/SecLists.git",
+    "PayloadsAllTheThings": "https://github.com/swisskyrepo/PayloadsAllTheThings.git",
+}
 
 
 def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None, dry_run: bool = False) -> None:
@@ -75,6 +80,15 @@ def clone_tools(dry_run: bool) -> None:
             continue
         run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(destination)], dry_run=dry_run)
         run(["git", "checkout", revision], cwd=destination, dry_run=dry_run)
+
+
+def install_wordlists(dry_run: bool) -> None:
+    """Install curated wordlist collections shallowly; never update user copies implicitly."""
+    WORDLISTS.mkdir(parents=True,exist_ok=True)
+    for name,url in WORDLIST_REPOSITORIES.items():
+        destination=WORDLISTS/name
+        if destination.exists():print(f"= {name} wordlists: already present");continue
+        run(["git","clone","--depth","1","--filter=blob:none",url,str(destination)],dry_run=dry_run)
 
 
 def python_executable(environment: Path) -> Path:
@@ -258,6 +272,7 @@ def main() -> int:
     if not shutil.which("git"):
         parser.error("git is required")
     clone_tools(args.dry_run)
+    install_wordlists(args.dry_run)
     install_python(args.dry_run, args.force)
     install_go(args.dry_run, args.force)
     if not args.dry_run:

@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -72,6 +73,34 @@ class PipelineTests(unittest.TestCase):
             pipeline.db.conn.commit()
             rows=pipeline.db.values("SELECT url FROM repositories WHERE run_id=?",(pipeline.run_id,))
             self.assertEqual(rows,["https://github.com/ExampleOrg/useful-repo.git"])
+
+    def test_forms_are_inventoried_without_submitting_them(self):
+        cfg = rp.Config("example.com","deep",Path("."),50,10,10,3,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg)
+            pipeline.inventory_forms("https://example.com/search",'<form action="/find" method="get"><input name="q"><input type="password" name="password"></form>')
+            rows=pipeline.db.conn.execute("SELECT action_url,method,name,input_type FROM input_points ORDER BY name").fetchall()
+            self.assertEqual(len(rows),2)
+            self.assertEqual(rows[1][0],"https://example.com/find")
+
+    def test_encoded_candidate_classifier_finds_tokens_and_hashes(self):
+        cfg = rp.Config("example.com","standard",Path("."),50,10,10,3,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg)
+            values=pipeline.encoded_candidates("https://example.com/?data=SGVsbG8gd29ybGQ%3D","digest=5d41402abc4b2a76b9719d911017c592")
+            self.assertTrue(any(kind=="url-value" for _,_,kind in values))
+            self.assertTrue(any(kind=="hex-or-hash" for _,_,kind in values))
+
+    def test_ducky_analyzer_decodes_without_misclassifying_encoding_as_hash(self):
+        cfg = rp.Config("example.com","standard",Path("."),50,10,10,3,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg)
+            if not pipeline.tool("ducky-ana"):self.skipTest("bundled ducky-ana is unavailable on this platform")
+            asyncio.run(pipeline.analyze_encoded("https://example.com/","value=SGVsbG8gd29ybGQ="))
+            row=pipeline.db.conn.execute("SELECT kind,is_hash,decoded_preview FROM encoded_artifacts").fetchone()
+            self.assertEqual(row["kind"],"Base64 standard")
+            self.assertEqual(row["is_hash"],0)
+            self.assertIn("Hello world",row["decoded_preview"])
 
 
 if __name__ == "__main__": unittest.main()

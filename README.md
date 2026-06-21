@@ -2,9 +2,9 @@
 
 A staged Python orchestrator for **authorized** penetration tests and bug-bounty scopes. It uses installed best-of-breed tools, normalizes their output into SQLite, preserves raw evidence, shows live stage progress, and produces a self-contained dark-mode HTML report.
 
-After crawling, the pipeline inspects in-scope HTML, JavaScript, JSON, XML, source maps and other text resources for exposed credentials. Provider-specific formats, private keys, JWTs, database URLs and secret assignments are detected with regex plus entropy/context checks. Evidence is fingerprinted and redacted before it is written to disk.
+After crawling, the pipeline inspects in-scope HTML, JavaScript, JSON, XML, source maps and other text resources for exposed credentials. Provider-specific formats, private keys, JWTs, database URLs and secret assignments are detected with regex plus entropy/context checks. Evidence is fingerprinted and redacted before it is written to disk. Likely Base64, URL-encoded, hexadecimal, JWT, and hash artifacts are classified with bundled `bin/ducky-ana`; encodings receive bounded decoded analysis while hashes are identified but never cracked.
 
-WHOIS and structured RDAP registration data are normalized into the report. Recon-ng enriches hosts through a bounded, no-key module set (certificate transparency, HackerTarget, ThreatMiner, MX/SPF) using an isolated per-run workspace. The deep profile ranks and deduplicates parameterized endpoints before bounded XSS checks with Dalfox and XSStrike and conservative SQL injection detection with sqlmap.
+WHOIS and structured RDAP registration data are normalized into the report. Recon-ng enriches hosts through a bounded, no-key module set (certificate transparency, HackerTarget, ThreatMiner, MX/SPF) using an isolated per-run workspace. The deep profile ranks and deduplicates parameterized endpoints before bounded XSS checks with Dalfox and XSStrike and conservative SQL injection detection with sqlmap. HTML forms are inventoried; only idempotent in-scope GET fields receive automatic inert reflection canaries. Password, token, file, checkout, and state-changing inputs are excluded.
 
 ## Quick start
 
@@ -69,7 +69,7 @@ Deep active checks are bounded by `--active-max-urls` (default 25) and `--active
 
 The deep profile also runs Arjun parameter discovery, bounded Nikto checks, linked GitHub repository secret scanning with Gitleaks and TruffleHog, and TLS analysis with SSLyze, SSLScan, and testssl.sh. Mantra supplements the built-in web/JavaScript detector; its raw matches are immediately confidence-filtered, fingerprinted, redacted, and overwritten. TruffleHog verification is deliberately disabled so discovered credentials are never used. Subdomain takeover candidates are independently checked with SubOver and Nuclei takeover templates. Because SubOver is discontinued, treat its output as a lead requiring manual DNS/provider confirmation.
 
-The default FFUF wordlist is `/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt`. Override it with `--wordlist PATH`.
+Setup shallow-clones SecLists and PayloadsAllTheThings under `tools/wordlists/`. FFUF defaults to managed SecLists `Discovery/Web-Content/common.txt`, with system SecLists paths as fallbacks. PayloadsAllTheThings is installed as analyst reference material and is not sprayed automatically. Override content discovery with `--wordlist PATH`.
 
 ## Multiple targets
 

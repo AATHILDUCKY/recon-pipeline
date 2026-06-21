@@ -115,7 +115,7 @@ def result_database(app: Flask, stored_dir: str | None) -> Path | None:
 def read_results(app: Flask, stored_dir: str | None) -> dict[str, Any]:
     db_path = result_database(app, stored_dir)
     empty = {"counts": {}, "services": [], "ports": [], "dns": [], "findings": [],
-             "endpoints": [], "repositories": [], "tools": [], "domain_info": []}
+             "endpoints": [], "repositories": [], "tools": [], "domain_info": [], "inputs": [], "encoded": []}
     if not db_path:
         return empty
     try:
@@ -126,7 +126,7 @@ def read_results(app: Flask, stored_dir: str | None) -> dict[str, Any]:
             db.close(); return empty
         run_id = run["id"]
         tables = {"Assets": "assets", "DNS": "dns_records", "Ports": "ports", "Web services": "http_services",
-                  "Endpoints": "endpoints", "Findings": "findings", "Repositories": "repositories"}
+                  "Endpoints": "endpoints", "Findings": "findings", "Repositories": "repositories", "Inputs": "input_points", "Encoded values": "encoded_artifacts"}
         data = dict(empty)
         data["counts"] = {label: db.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,)).fetchone()[0]
                           for label, table in tables.items()}
@@ -139,6 +139,8 @@ def read_results(app: Flask, stored_dir: str | None) -> dict[str, Any]:
             "repositories": "SELECT url,source,scanned FROM repositories WHERE run_id=? ORDER BY url LIMIT 200",
             "tools": "SELECT tool,stage,status,duration,exit_code FROM tool_runs WHERE run_id=? ORDER BY id LIMIT 500",
             "domain_info": "SELECT key,value,source FROM domain_info WHERE run_id=? ORDER BY key LIMIT 500",
+            "inputs": "SELECT page_url,action_url,method,name,input_type,tested,reflection_context FROM input_points WHERE run_id=? ORDER BY page_url,name LIMIT 500",
+            "encoded": "SELECT source_url,location,kind,value_preview,decoded_preview,is_hash,analyzer FROM encoded_artifacts WHERE run_id=? ORDER BY source_url,location LIMIT 500",
         }
         for name, query in queries.items():
             rows = [dict(row) for row in db.execute(query, (run_id,)).fetchall()]

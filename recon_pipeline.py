@@ -14,6 +14,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import html
+from html.parser import HTMLParser
 import ipaddress
 import json
 import math
@@ -115,6 +116,8 @@ class Database:
         CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, run_id INTEGER, tool TEXT, severity TEXT, template_id TEXT, name TEXT, matched_at TEXT, host TEXT, evidence TEXT, UNIQUE(run_id,tool,template_id,matched_at));
         CREATE TABLE IF NOT EXISTS domain_info(id INTEGER PRIMARY KEY, run_id INTEGER, key TEXT, value TEXT, source TEXT, UNIQUE(run_id,key,value,source));
         CREATE TABLE IF NOT EXISTS repositories(id INTEGER PRIMARY KEY, run_id INTEGER, url TEXT, host TEXT, source TEXT, scanned INTEGER DEFAULT 0, UNIQUE(run_id,url));
+        CREATE TABLE IF NOT EXISTS input_points(id INTEGER PRIMARY KEY, run_id INTEGER, page_url TEXT, action_url TEXT, method TEXT, name TEXT, input_type TEXT, tested INTEGER DEFAULT 0, reflection_context TEXT, UNIQUE(run_id,page_url,action_url,method,name));
+        CREATE TABLE IF NOT EXISTS encoded_artifacts(id INTEGER PRIMARY KEY, run_id INTEGER, source_url TEXT, location TEXT, kind TEXT, value_preview TEXT, decoded_preview TEXT, is_hash INTEGER DEFAULT 0, analyzer TEXT, UNIQUE(run_id,source_url,location,kind,value_preview));
         CREATE TABLE IF NOT EXISTS tool_runs(id INTEGER PRIMARY KEY, run_id INTEGER, stage TEXT, tool TEXT, command_json TEXT, started_at TEXT, duration REAL, exit_code INTEGER, status TEXT, stdout_path TEXT, stderr_path TEXT);
         CREATE INDEX IF NOT EXISTS idx_assets_host ON assets(run_id,hostname); CREATE INDEX IF NOT EXISTS idx_endpoints_host ON endpoints(run_id,host);
         """)
@@ -224,6 +227,21 @@ class ScopedRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 
+class FormParser(HTMLParser):
+    """Small, dependency-free form inventory parser."""
+    def __init__(self) -> None:
+        super().__init__(); self.forms: list[dict[str, Any]]=[]; self.current: dict[str, Any] | None=None
+    def handle_starttag(self, tag: str, attrs: list[tuple[str,str | None]]) -> None:
+        values={k.lower():(v or "") for k,v in attrs}
+        if tag.lower()=="form":
+            self.current={"action":values.get("action",""),"method":values.get("method","get").lower(),"inputs":[]};self.forms.append(self.current)
+        elif tag.lower() in {"input","textarea","select"} and self.current is not None:
+            name=values.get("name","").strip();kind=values.get("type","text" if tag.lower()!="select" else "select").lower()
+            if name:self.current["inputs"].append({"name":name,"type":kind,"value":values.get("value","")})
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower()=="form":self.current=None
+
+
 class Pipeline:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -234,6 +252,7 @@ class Pipeline:
         self.db = Database(self.root / "recon.sqlite3")
         self.run_id = self.db.start(cfg.domain, cfg.profile, dataclasses.asdict(cfg) | {"output": str(cfg.output), "wordlist": str(cfg.wordlist) if cfg.wordlist else None, "skip": sorted(cfg.skip)})
         self.done = 0; self.total = 19 if cfg.profile == "deep" else (5 if cfg.profile == "passive" else 12)
+        self.encoded_analyzed=0
         self.pipeline_started=time.monotonic()
 
     def log(self, message: str, color: str = "cyan") -> None:
@@ -247,9 +266,9 @@ class Pipeline:
 
     def tool(self, *names: str) -> str | None:
         for name in names:
-            local = Path(__file__).resolve().parent / "tools" / "bin" / name
-            if local.is_file() and os.access(local, os.X_OK):
-                return str(local)
+            base=Path(__file__).resolve().parent
+            for local in (base/"bin"/name,base/"tools"/"bin"/name):
+                if local.is_file() and os.access(local, os.X_OK):return str(local)
             found = shutil.which(name)
             if found:
                 return found
@@ -540,7 +559,122 @@ class Pipeline:
 
     async def technologies(self) -> None:
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=?",(self.run_id,)); inp=self.write_input("live-urls.txt",urls)
-        await self.run_tool("06-tech","whatweb",["--log-json="+str(self.raw/"whatweb.json"),"--no-errors","--aggression=1","--input-file="+str(inp)],timeout=1800)
+        output=self.raw/"whatweb.json"
+        await self.run_tool("06-tech","whatweb",["--log-json="+str(output),"--no-errors","--aggression=1","--input-file="+str(inp)],timeout=1800)
+        if output.exists():
+            try:data=json.loads(output.read_text(errors="replace"))
+            except json.JSONDecodeError:data=[]
+            for row in data if isinstance(data,list) else []:
+                url=canonical_url(str(row.get("target") or ""),self.cfg.domain);plugins=row.get("plugins",{})
+                if not url or not isinstance(plugins,dict):continue
+                labels=[]
+                for name,details in plugins.items():
+                    versions=details.get("version",[]) if isinstance(details,dict) else []
+                    versions=versions if isinstance(versions,list) else [versions]
+                    label=str(name)+(":"+",".join(str(v) for v in versions if v) if any(versions) else "")
+                    labels.append(label)
+                existing=self.db.conn.execute("SELECT technologies FROM http_services WHERE run_id=? AND url=?",(self.run_id,url)).fetchone()
+                prior=[]
+                if existing:
+                    try:prior=json.loads(existing[0] or "[]")
+                    except json.JSONDecodeError:pass
+                self.db.execute("UPDATE http_services SET technologies=? WHERE run_id=? AND url=?",(json.dumps(sorted(set(prior+labels),key=str.lower)),self.run_id,url))
+        self.db.conn.commit()
+        self.done+=1
+
+    def encoded_candidates(self, url: str, text: str) -> list[tuple[str,str,str]]:
+        """Return bounded likely encodings/hashes; avoid ordinary words and giant blobs."""
+        found=[];seen=set()
+        try:
+            for key,value in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query,keep_blank_values=True):
+                if 8<=len(value)<=4096:found.append((f"query:{key}",value,"url-value"))
+        except ValueError:pass
+        patterns=(
+            ("jwt",re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?\b")),
+            ("hex-or-hash",re.compile(r"(?<![A-Fa-f0-9])(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}|[A-Fa-f0-9]{96}|[A-Fa-f0-9]{128})(?![A-Fa-f0-9])")),
+            ("base64",re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/]{12,2048}={0,2}(?![A-Za-z0-9+/=_-])")),
+            ("percent-encoded",re.compile(r"(?:%[0-9A-Fa-f]{2}){4,256}")),
+        )
+        for kind,pattern in patterns:
+            for match in pattern.finditer(text[:self.cfg.secret_max_bytes]):
+                value=match.group(0)
+                if kind=="base64" and "=" not in value and (value.isalpha() or not (re.search(r"[A-Z]",value) and re.search(r"[a-z]",value) and re.search(r"\d",value))):continue
+                found.append((f"body:{match.start()}",value,kind))
+        result=[]
+        for location,value,kind in found:
+            identity=(location,value)
+            if identity not in seen:seen.add(identity);result.append((location,value,kind))
+        return result[:20]
+
+    async def analyze_encoded(self, source_url: str, text: str) -> None:
+        analyzer=self.tool("ducky-ana")
+        for idx,(location,value,hint) in enumerate(self.encoded_candidates(source_url,text)):
+            if self.encoded_analyzed>=500:return
+            if any(location==f"query:{key}" for key in SECRET_QUERY_KEYS):continue
+            is_hash=hint=="hex-or-hash" and len(value) in {32,40,64,96,128}
+            preview=redact_secret(value) if is_hash or len(value)>80 else value
+            decoded="Hash fingerprint only; hashes are classified and not decrypted." if is_hash else ""
+            kind=hint
+            if analyzer and "ducky-ana" not in self.cfg.skip:
+                try:
+                    proc=await asyncio.create_subprocess_exec(analyzer,"-no-color","-max","1024",value,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+                    stdout,_=await asyncio.wait_for(proc.communicate(),timeout=10)
+                    analysis=stdout.decode(errors="replace")[:4000].replace(value,"[INPUT REDACTED]")
+                    low=analysis.lower()
+                    if re.search(r"\(hash\s*/",low):is_hash=True
+                    decoded=analysis
+                    first=next((line.split(":",1)[1].strip() for line in analysis.splitlines() if line.lower().startswith(("type:","encoding:")) and ":" in line),"")
+                    if not first:
+                        match=re.search(r"\[01\]\s+(.+?)\s{2,}\((?:encoding|hash|token)\s*/",analysis,re.I)
+                        first=match.group(1).strip() if match else ""
+                    if first:kind=first
+                except (OSError,asyncio.TimeoutError):pass
+            self.db.execute("INSERT OR IGNORE INTO encoded_artifacts(run_id,source_url,location,kind,value_preview,decoded_preview,is_hash,analyzer) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,source_url,location,kind,preview,decoded[:4000],int(is_hash),"ducky-ana" if analyzer else "built-in classifier"))
+            self.encoded_analyzed+=1
+
+    def inventory_forms(self, page_url: str, text: str) -> None:
+        parser=FormParser()
+        try:parser.feed(text)
+        except (ValueError,AssertionError):return
+        for form in parser.forms:
+            action=canonical_url(urllib.parse.urljoin(page_url,str(form["action"] or page_url)),self.cfg.domain)
+            if not action:continue
+            method=str(form["method"] or "get").upper()
+            for field in form["inputs"]:
+                self.db.execute("INSERT OR IGNORE INTO input_points(run_id,page_url,action_url,method,name,input_type) VALUES(?,?,?,?,?,?)",(self.run_id,page_url,action,method,str(field["name"])[:200],str(field["type"])[:40]))
+
+    def fetch_probe(self, url: str) -> tuple[int,str] | None:
+        request=urllib.request.Request(url,headers={"User-Agent":f"ReconPipeline/{VERSION} authorized-input-analysis","Accept":"text/html,text/plain,application/json","Accept-Encoding":"identity"})
+        opener=urllib.request.build_opener(ScopedRedirect(self.cfg.domain),urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        try:
+            with opener.open(request,timeout=self.cfg.timeout) as response:
+                final=canonical_url(response.geturl(),self.cfg.domain)
+                if not final:return None
+                return int(response.status),response.read(min(self.cfg.secret_max_bytes,1_000_000)).decode(response.headers.get_content_charset() or "utf-8",errors="replace")
+        except (urllib.error.URLError,TimeoutError,ValueError,ssl.SSLError,LookupError):return None
+
+    async def input_checks(self) -> None:
+        safe_types={"text","search","url","email","tel","number","select","hidden"};blocked_names={"password","passwd","pass","csrf","token","otp","captcha","card","checkout","delete","logout"}
+        rows=self.db.conn.execute("SELECT * FROM input_points WHERE run_id=? AND method='GET' ORDER BY id LIMIT ?",(self.run_id,self.cfg.active_max_urls)).fetchall()
+        self.log(f"10-inputs: testing {len(rows)} idempotent GET input points with reflection canaries")
+        for idx,row in enumerate(rows):
+            name=str(row["name"]);kind=str(row["input_type"]).lower()
+            if kind not in safe_types or any(word in name.lower() for word in blocked_names):continue
+            marker=f"rp{self.run_id}x{idx}canary"
+            p=urllib.parse.urlsplit(row["action_url"]);pairs=urllib.parse.parse_qsl(p.query,keep_blank_values=True);pairs=[(k,v) for k,v in pairs if k!=name]+[(name,marker)]
+            probe=canonical_url(urllib.parse.urlunsplit((p.scheme,p.netloc,p.path,urllib.parse.urlencode(pairs),"")),self.cfg.domain)
+            if not probe:continue
+            result=await asyncio.to_thread(self.fetch_probe,probe);await asyncio.sleep(self.cfg.active_delay)
+            context="not reflected"
+            if result and marker in result[1]:
+                body=result[1];pos=body.find(marker);window=body[max(0,pos-120):pos+len(marker)+120]
+                if re.search(r"<[a-z][^>]*(?:value|href|src|data-[\w-]+)=[\"'][^\"']*"+re.escape(marker),window,re.I):context="HTML attribute"
+                elif re.search(r"<script\b[^>]*>[\s\S]*"+re.escape(marker),window,re.I):context="script block"
+                elif re.search(r">[^<]*"+re.escape(marker),window):context="HTML text"
+                else:context="response body"
+                severity="medium" if context in {"HTML attribute","script block"} else "low"
+                self.add_tool_finding("reflection-probe",severity,"Input reflected in "+context,probe,f"GET field {name!r} reflected a unique inert canary. Reflection is not proof of XSS; validate with the deep XSS scanners.")
+            self.db.execute("UPDATE input_points SET tested=1,reflection_context=? WHERE id=?",(context,row["id"]));self.db.conn.commit()
         self.done+=1
 
     def scan_text(self, url: str, text: str) -> list[dict[str, Any]]:
@@ -591,6 +725,8 @@ class Pipeline:
             if not result:return
             final,text=result
             self.add_endpoint(final,"secret-scanner")
+            self.inventory_forms(final,text)
+            await self.analyze_encoded(final,text)
             for linked in URL_RE.findall(text):self.add_repository(linked,"page-source")
             for item in self.scan_text(final,text):
                 identity=f"{item['type']}:{item['fingerprint']}"
@@ -787,7 +923,8 @@ class Pipeline:
     async def directories(self) -> None:
         word=self.cfg.wordlist
         if not word:
-            choices=[Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt"),Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt")]
+            base=Path(__file__).resolve().parent
+            choices=[base/"tools/wordlists/SecLists/Discovery/Web-Content/common.txt",base/"tools/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt",Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt"),Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt")]
             word=next((p for p in choices if p.exists()),None)
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=? ORDER BY url LIMIT 25",(self.run_id,))
         self.log(f"content-discovery: FFUF against {len(urls)} live services")
@@ -809,7 +946,7 @@ class Pipeline:
             await self.probe(); await self.crawl(); await self.technologies()
             if self.cfg.profile == "deep":await self.parameter_discovery();await self.directories()
             await self.secrets();await self.tls_checks()
-            if self.cfg.profile == "deep":await self.repository_secrets();await self.xss_checks();await self.sqli_checks();await self.nuclei();await self.nikto_checks()
+            if self.cfg.profile == "deep":await self.input_checks();await self.repository_secrets();await self.xss_checks();await self.sqli_checks();await self.nuclei();await self.nikto_checks()
             self.report(); status="complete"; self.log(f"complete: {self.root}","green")
         except (KeyboardInterrupt, asyncio.CancelledError):
             status="cancelled"; raise
@@ -818,7 +955,7 @@ class Pipeline:
 
     def report(self) -> None:
         c=self.db.conn
-        counts={name:c.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",(self.run_id,)).fetchone()[0] for name,table in {"Domain facts":"domain_info","Assets":"assets","DNS records":"dns_records","Open ports":"ports","Web services":"http_services","Endpoints":"endpoints","Repositories":"repositories","Findings":"findings"}.items()}
+        counts={name:c.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",(self.run_id,)).fetchone()[0] for name,table in {"Domain facts":"domain_info","Assets":"assets","DNS records":"dns_records","Open ports":"ports","Web services":"http_services","Endpoints":"endpoints","Input points":"input_points","Encoded values":"encoded_artifacts","Repositories":"repositories","Findings":"findings"}.items()}
         services=c.execute("SELECT * FROM http_services WHERE run_id=? ORDER BY host,url",(self.run_id,)).fetchall()
         ports=c.execute("SELECT * FROM ports WHERE run_id=? ORDER BY hostname,port",(self.run_id,)).fetchall()
         findings=c.execute("SELECT * FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",(self.run_id,)).fetchall()
@@ -826,6 +963,8 @@ class Pipeline:
         domain_info=c.execute("SELECT * FROM domain_info WHERE run_id=? ORDER BY key,value",(self.run_id,)).fetchall()
         endpoints=c.execute("SELECT * FROM endpoints WHERE run_id=? ORDER BY host,path LIMIT 10000",(self.run_id,)).fetchall()
         repositories=c.execute("SELECT * FROM repositories WHERE run_id=? ORDER BY url",(self.run_id,)).fetchall()
+        inputs=c.execute("SELECT * FROM input_points WHERE run_id=? ORDER BY page_url,name",(self.run_id,)).fetchall()
+        encoded=c.execute("SELECT * FROM encoded_artifacts WHERE run_id=? ORDER BY source_url,location",(self.run_id,)).fetchall()
         tool_runs=c.execute("SELECT tool,stage,status,ROUND(duration,2) duration,exit_code FROM tool_runs WHERE run_id=? ORDER BY id",(self.run_id,)).fetchall()
         def esc(x:Any)->str:return html.escape(str(x or ""))
         cards="".join(f'<div class="card"><b>{esc(v)}</b><span>{esc(k)}</span></div>' for k,v in counts.items())
@@ -845,6 +984,8 @@ class Pipeline:
         <h2>Scanner observations</h2>{table(['Severity','Name','Template','Matched at'],((r['severity'],r['name'],r['template_id'],redact_url(r['matched_at'])) for r in findings))}
         <h2>Tool execution ledger</h2>{table(['Tool','Stage','Status','Seconds','Exit'],((r['tool'],r['stage'],r['status'],r['duration'],r['exit_code']) for r in tool_runs))}
         <h2>Discovered repositories</h2>{table(['Repository','Source','Secret scanned'],((r['url'],r['source'],'yes' if r['scanned'] else 'no') for r in repositories))}
+        <h2>Input surface</h2>{table(['Page','Action','Method','Field','Type','Tested','Reflection'],((r['page_url'],r['action_url'],r['method'],r['name'],r['input_type'],'yes' if r['tested'] else 'no',r['reflection_context']) for r in inputs))}
+        <h2>Encoded and hashed values</h2>{table(['Source','Location','Type','Value preview','Decoded analysis','Hash'],((r['source_url'],r['location'],r['kind'],r['value_preview'],r['decoded_preview'],'yes' if r['is_hash'] else 'no') for r in encoded))}
         <h2>Discovered endpoints</h2><h3>JavaScript, source maps and structured data</h3>{links(js)}<h3>Parameterized entry points</h3>{links(parameterized)}<h3>Other in-scope links</h3>{links(other)}
         <p class="muted">Raw evidence and the complete SQLite database are stored beside this report. Scanner matches require manual validation.</p></main></body></html>"""
         (self.root/"report.html").write_text(doc); (self.root/"summary.json").write_text(json.dumps({"domain":self.cfg.domain,"run_id":self.run_id,"counts":counts,"generated_at":utcnow()},indent=2))

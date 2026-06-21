@@ -7,7 +7,10 @@ results, runtime databases, configuration, or existing tool checkouts.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +52,8 @@ GO_TOOLS = {
 }
 
 OS_COMMANDS = ("git", "go", "nmap", "whatweb", "whois", "dig", "sslscan", "nikto", "perl")
+STAMP_NAME = ".recon-pipeline-install.json"
+SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra", "trufflehog": "trufflehog"}
 
 
 def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None, dry_run: bool = False) -> None:
@@ -64,6 +69,10 @@ def clone_tools(dry_run: bool) -> None:
         if destination.exists():
             print(f"= {name}: already present")
             continue
+        binary = SOURCE_BINARIES.get(name)
+        if binary and binary_available(binary):
+            print(f"= {name}: source not needed; {binary} is already available")
+            continue
         run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(destination)], dry_run=dry_run)
         run(["git", "checkout", revision], cwd=destination, dry_run=dry_run)
 
@@ -72,22 +81,106 @@ def python_executable(environment: Path) -> Path:
     return environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def install_python(dry_run: bool) -> None:
-    if not VENV.exists() and not dry_run:
+def source_revision(source: Path) -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, text=True, capture_output=True, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def fingerprint(*paths: Path, salt: str = "") -> str:
+    digest = hashlib.sha256(f"python={sys.version_info[:2]};{salt}".encode())
+    for path in paths:
+        digest.update(str(path.relative_to(ROOT)).encode())
+        digest.update(path.read_bytes() if path.is_file() else b"missing")
+    return digest.hexdigest()
+
+
+def normalize_package(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def installed_packages(python: Path) -> dict[str, str]:
+    if not python.is_file():
+        return {}
+    code = "import importlib.metadata,json,re;print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower():d.version for d in importlib.metadata.distributions() if d.metadata['Name']}))"
+    try:
+        result = subprocess.run([str(python), "-c", code], text=True, capture_output=True, check=True)
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {}
+
+
+def required_packages(path: Path) -> dict[str, str | None]:
+    required: dict[str, str | None] = {}
+    if not path.is_file():
+        return required
+    for raw in path.read_text(errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "-", "git+", "http:" , "https:")):
+            continue
+        match = re.match(r"([A-Za-z0-9_.-]+)\s*(?:==\s*([^\s;]+))?", line)
+        if match:
+            required[normalize_package(match.group(1))] = match.group(2)
+    return required
+
+
+def environment_ready(environment: Path, wanted: str, requirements: Path | None = None, distribution: str | None = None, *, record: bool = True) -> bool:
+    python = python_executable(environment)
+    if not python.is_file():
+        return False
+    stamp = environment / STAMP_NAME
+    try:
+        if json.loads(stamp.read_text()).get("fingerprint") == wanted:
+            return True
+    except (OSError, json.JSONDecodeError):
+        pass
+    installed = installed_packages(python)
+    required = required_packages(requirements) if requirements else {}
+    if distribution:
+        required[normalize_package(distribution)] = None
+    if not required or any(name not in installed or (version and installed[name] != version) for name, version in required.items()):
+        return False
+    if record:
+        stamp.write_text(json.dumps({"fingerprint": wanted}, indent=2) + "\n")
+    return True
+
+
+def mark_environment(environment: Path, wanted: str, dry_run: bool) -> None:
+    if not dry_run:
+        (environment / STAMP_NAME).write_text(json.dumps({"fingerprint": wanted}, indent=2) + "\n")
+
+
+def install_python(dry_run: bool, force: bool) -> None:
+    created = not python_executable(VENV).is_file()
+    if created and not dry_run:
         print(f"+ create virtual environment {VENV}")
         venv.EnvBuilder(with_pip=True).create(VENV)
-    python = str(python_executable(VENV))
-    run([python, "-m", "pip", "install", "--upgrade", "pip", "wheel"], dry_run=dry_run)
-    run([python, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")], dry_run=dry_run)
+    python = python_executable(VENV)
+    main_requirements = ROOT / "requirements.txt"
+    wanted = fingerprint(main_requirements)
+    if not force and not created and environment_ready(VENV, wanted, main_requirements, record=not dry_run):
+        print("= application Python dependencies: already satisfied")
+    else:
+        if created or force:
+            run([str(python), "-m", "pip", "install", "--upgrade", "pip", "wheel"], dry_run=dry_run)
+        run([str(python), "-m", "pip", "install", "-r", str(main_requirements)], dry_run=dry_run)
+        mark_environment(VENV, wanted, dry_run)
     integrations = (("recon-ng", "REQUIREMENTS"), ("XSStrike", "requirements.txt"), ("spiderfoot", "requirements.txt"))
     for name, requirements in integrations:
         source, environment = TOOLS / name, TOOLS / name / ".venv"
+        requirement_file = source / requirements
         if not source.exists() and not dry_run:
+            continue
+        wanted = fingerprint(requirement_file, salt=source_revision(source))
+        if not force and environment_ready(environment, wanted, requirement_file, record=not dry_run):
+            print(f"= {name} Python dependencies: already satisfied")
             continue
         if not environment.exists() and not dry_run:
             print(f"+ create isolated environment {environment}")
             venv.EnvBuilder(with_pip=True).create(environment)
-        run([str(python_executable(environment)), "-m", "pip", "install", "-r", str(source / requirements)], cwd=source, dry_run=dry_run)
+        run([str(python_executable(environment)), "-m", "pip", "install", "-r", str(requirement_file)], cwd=source, dry_run=dry_run)
+        mark_environment(environment, wanted, dry_run)
     for name, install_target in (("theHarvester", "."),):
         source, environment = TOOLS / name, TOOLS / name / ".venv"
         if not source.exists() and not dry_run:
@@ -95,13 +188,23 @@ def install_python(dry_run: bool) -> None:
         if name == "theHarvester" and sys.version_info < (3, 12):
             print("! theHarvester requires Python 3.12+; skipping this optional integration")
             continue
+        wanted = fingerprint(source / "pyproject.toml", salt=source_revision(source))
+        if not force and environment_ready(environment, wanted, distribution="theHarvester", record=not dry_run):
+            print("= theHarvester Python dependencies: already satisfied")
+            continue
         if not environment.exists() and not dry_run:
             print(f"+ create isolated environment {environment}")
             venv.EnvBuilder(with_pip=True).create(environment)
         run([str(python_executable(environment)), "-m", "pip", "install", install_target], cwd=source, dry_run=dry_run)
+        mark_environment(environment, wanted, dry_run)
 
 
-def install_go(dry_run: bool) -> None:
+def binary_available(name: str) -> bool:
+    local = BIN / name
+    return (local.is_file() and os.access(local, os.X_OK)) or shutil.which(name) is not None
+
+
+def install_go(dry_run: bool, force: bool) -> None:
     if not shutil.which("go"):
         print("! Go is unavailable; skipping Go-based tools")
         return
@@ -109,13 +212,13 @@ def install_go(dry_run: bool) -> None:
     env = os.environ.copy()
     env["GOBIN"] = str(BIN)
     for name, module in GO_TOOLS.items():
-        if (BIN / name).exists():
-            print(f"= {name}: already built")
+        if not force and binary_available(name):
+            print(f"= {name}: already available")
         else:
             run(["go", "install", module], env=env, dry_run=dry_run)
     for name, source in (("gitleaks", "gitleaks"), ("trufflehog", "trufflehog"), ("mantra", "mantra"), ("subover", "SubOver")):
-        if (BIN / name).exists():
-            print(f"= {name}: already built")
+        if not force and binary_available(name):
+            print(f"= {name}: already available")
         elif (TOOLS / source).exists() or dry_run:
             run(["go", "build", "-o", str(BIN / name), "."], cwd=TOOLS / source, dry_run=dry_run)
 
@@ -135,7 +238,7 @@ def status() -> int:
     print(f"Python: {sys.version.split()[0]}")
     print(f"Tool repositories: {sum((TOOLS / name).exists() for name in REPOSITORIES)}/{len(REPOSITORIES)}")
     managed = set(GO_TOOLS) | {"gitleaks", "trufflehog", "mantra", "subover"}
-    print(f"Managed binaries: {sum((BIN / name).exists() for name in managed)}/{len(managed)}")
+    print(f"Available managed binaries: {sum(binary_available(name) for name in managed)}/{len(managed)}")
     if missing:
         print("Missing OS commands (install with your system package manager): " + ", ".join(missing))
     print("Results and runtime state: preserved")
@@ -146,6 +249,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Install Recon Pipeline and its managed integrations")
     parser.add_argument("command", nargs="?", choices=("install", "status"), default="install")
     parser.add_argument("--dry-run", action="store_true", help="show planned commands without changing files")
+    parser.add_argument("--force", action="store_true", help="reinstall dependencies and rebuild binaries")
     args = parser.parse_args()
     if args.command == "status":
         return status()
@@ -154,8 +258,8 @@ def main() -> int:
     if not shutil.which("git"):
         parser.error("git is required")
     clone_tools(args.dry_run)
-    install_python(args.dry_run)
-    install_go(args.dry_run)
+    install_python(args.dry_run, args.force)
+    install_go(args.dry_run, args.force)
     if not args.dry_run:
         write_env()
     print("\nInstallation complete. Existing results were not modified.")

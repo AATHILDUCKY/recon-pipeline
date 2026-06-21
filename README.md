@@ -21,6 +21,10 @@ The installer never deletes or replaces `results/`, `instance/`, or an existing
 `python3 setup.py status` with the system package manager. Re-running the
 installer is safe and skips existing clones and binaries.
 
+It also skips Python package installation when the requirements and tool source
+have not changed. To deliberately repair or rebuild everything, run
+`python3 setup.py --force`.
+
 ```bash
 venv/bin/python recon_pipeline.py example.com --i-have-authorization --profile standard
 ```

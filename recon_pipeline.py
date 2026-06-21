@@ -441,9 +441,10 @@ class Pipeline:
     async def takeover_checks(self) -> None:
         hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=?",(self.run_id,));inp=self.write_input("all-subdomains.txt",hosts)
         self.log(f"03-takeover: checking {len(hosts)} discovered hosts")
-        base=Path(__file__).resolve().parent;subover=base/"tools/bin/subover";subout=self.raw/"takeover-subover.txt"
-        if subover.exists() and "subover" not in self.cfg.skip:
-            code,out=await self.run_tool("03-takeover","subover",["-l",str(inp),"-o",str(subout),"-t",str(min(10,self.cfg.concurrency)),"-timeout",str(self.cfg.timeout)],timeout=1800,executable=str(subover),cwd=base/"tools/SubOver")
+        base=Path(__file__).resolve().parent;subover=self.tool("subover");subout=self.raw/"takeover-subover.txt"
+        if subover and "subover" not in self.cfg.skip:
+            source=base/"tools/SubOver"
+            code,out=await self.run_tool("03-takeover","subover",["-l",str(inp),"-o",str(subout),"-t",str(min(10,self.cfg.concurrency)),"-timeout",str(self.cfg.timeout)],timeout=1800,executable=subover,cwd=source if source.exists() else base)
             evidence=(subout.read_text(errors="replace") if subout.exists() else out.read_text(errors="replace"))
             for line in evidence.splitlines():
                 if any(word in line.lower() for word in ("vulnerable","takeover","can be claimed")):
@@ -597,11 +598,11 @@ class Pipeline:
                 all_findings.append(item)
         for start in range(0,len(targets),200):
             await asyncio.gather(*(inspect(url) for url in targets[start:start+200])); self.db.conn.commit()
-        mantra=Path(__file__).resolve().parent/"tools/bin/mantra"
+        mantra=self.tool("mantra")
         mantra_targets=[u for u in targets if Path(urllib.parse.urlsplit(u).path).suffix.lower() in {".js",".mjs",".json",".map"}][:500]
-        if mantra_targets and mantra.exists() and "mantra" not in self.cfg.skip:
+        if mantra_targets and mantra and "mantra" not in self.cfg.skip:
             mantra_input=self.write_input("mantra-urls.txt",mantra_targets)
-            _,mantra_out=await self.run_tool("07-secrets","mantra",["-s","-t",str(min(5,self.cfg.concurrency)),"-ua",f"ReconPipeline/{VERSION}"],timeout=1800,stdin=mantra_input,executable=str(mantra))
+            _,mantra_out=await self.run_tool("07-secrets","mantra",["-s","-t",str(min(5,self.cfg.concurrency)),"-ua",f"ReconPipeline/{VERSION}"],timeout=1800,stdin=mantra_input,executable=mantra)
             safe_lines=[]
             for raw_line in mantra_out.read_text(errors="replace").splitlines():
                 line=re.sub(r"\x1b\[[0-9;]*m","",raw_line);url_match=URL_RE.search(line)
@@ -621,14 +622,14 @@ class Pipeline:
         repos=self.db.conn.execute("SELECT id,url FROM repositories WHERE run_id=? ORDER BY url LIMIT ?",(self.run_id,self.cfg.repo_max)).fetchall()
         self.log(f"08-repos: scanning {len(repos)} linked repositories with redacted output")
         base=Path(__file__).resolve().parent;clone_root=self.root/"repositories";clone_root.mkdir()
-        gitleaks=base/"tools/bin/gitleaks";trufflehog=base/"tools/bin/trufflehog"
+        gitleaks=self.tool("gitleaks");trufflehog=self.tool("trufflehog")
         for idx,row in enumerate(repos):
             repo_url=str(row["url"]);dest=clone_root/f"repo-{idx:03d}"
             code,_=await self.run_tool("08-repos",f"git-clone-{idx:03d}",["clone","--depth","500","--filter=blob:limit=5m","--no-tags",repo_url,str(dest)],timeout=900,executable=self.tool("git"))
             if code!=0:continue
-            if gitleaks.exists() and "gitleaks" not in self.cfg.skip:
+            if gitleaks and "gitleaks" not in self.cfg.skip:
                 report=self.raw/f"gitleaks-{idx:03d}.json"
-                await self.run_tool("08-repos",f"gitleaks-{idx:03d}",["git",str(dest),"--report-format","json","--report-path",str(report),"--redact=100","--no-banner","--no-color","--max-decode-depth","1","--timeout","300"],timeout=600,executable=str(gitleaks))
+                await self.run_tool("08-repos",f"gitleaks-{idx:03d}",["git",str(dest),"--report-format","json","--report-path",str(report),"--redact=100","--no-banner","--no-color","--max-decode-depth","1","--timeout","300"],timeout=600,executable=gitleaks)
                 if report.exists():
                     try:data=json.loads(report.read_text(errors="replace"))
                     except json.JSONDecodeError:data=[]
@@ -637,8 +638,8 @@ class Pipeline:
                         safe={k:item.get(k) for k in ("Description","File","StartLine","Commit","RuleID","Fingerprint")};clean.append(safe)
                         self.add_tool_finding("gitleaks","high",str(item.get("Description") or item.get("RuleID") or "Repository secret"),repo_url,json.dumps(safe))
                     report.write_text(json.dumps(clean,indent=2))
-            if trufflehog.exists() and "trufflehog" not in self.cfg.skip:
-                _,out=await self.run_tool("08-repos",f"trufflehog-{idx:03d}",["git","file://"+str(dest.resolve()),"--json","--no-verification","--no-update"],timeout=900,executable=str(trufflehog))
+            if trufflehog and "trufflehog" not in self.cfg.skip:
+                _,out=await self.run_tool("08-repos",f"trufflehog-{idx:03d}",["git","file://"+str(dest.resolve()),"--json","--no-verification","--no-update"],timeout=900,executable=trufflehog)
                 clean=[]
                 for item in json_lines(out):
                     meta=item.get("SourceMetadata",{});safe={"detector":item.get("DetectorName"),"verified":False,"source_metadata":meta,"decoder":item.get("DecoderName")};clean.append(safe)

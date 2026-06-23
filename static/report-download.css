@@ -1,0 +1,31 @@
+.target-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.secondary {
+  align-items: center;
+  border: 1px solid #2a675a;
+  border-radius: 8px;
+  color: var(--accent);
+  display: inline-flex;
+  font-weight: 750;
+  padding: 10px 15px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.secondary:hover {
+  background: #102d27;
+}
+
+@media (max-width: 760px) {
+  .target-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .secondary {
+    justify-content: center;
+  }
+}

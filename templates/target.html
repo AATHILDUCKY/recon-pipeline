@@ -1,8 +1,8 @@
 {% extends "base.html" %}{% block title %}{{ target.domain }} · Recon Console{% endblock %}{% block content %}
 <a class="back" href="{{ url_for('dashboard') }}">← All targets</a>
 <section class="hero compact"><div><p class="eyebrow">TARGET INTELLIGENCE</p><h1>{{ target.domain }}</h1><p class="muted">Added {{ target.created_at }}</p></div>
-  <form action="{{ url_for('rescan', target_id=target.id) }}" method="post" class="rescan"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="authorized" value="yes">
-    <select name="profile"><option value="passive">Passive</option><option value="standard" selected>Standard</option><option value="deep">Deep</option></select><button class="primary">Run new scan</button></form></section>
+  <div class="target-actions">{% if latest_complete %}<a class="secondary" href="{{ url_for('download_markdown_report', target_id=target.id) }}">Download Markdown report</a>{% endif %}<form action="{{ url_for('rescan', target_id=target.id) }}" method="post" class="rescan"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="authorized" value="yes">
+    <select name="profile"><option value="passive">Passive</option><option value="standard" selected>Standard</option><option value="deep">Deep</option></select><button class="primary">Run new scan</button></form></div></section>
 {% if active_scan %}<section class="panel scan-monitor" data-scan-id="{{ active_scan.id }}"><div class="panel-head"><div><h2>Scan in progress</h2><p>{{ active_scan.profile }} profile · <span data-status>{{ active_scan.status }}</span></p></div><span class="spinner"></span></div><pre data-log>Waiting for scanner output…</pre></section>{% endif %}
 {% if latest_complete %}
 <section class="stats result-stats">{% for label,count in results.counts.items() %}<article><strong>{{ count }}</strong><span>{{ label }}</span></article>{% endfor %}</section>

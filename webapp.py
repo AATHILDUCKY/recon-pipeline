@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import datetime as dt
 import hmac
+import html
 import os
 import re
 import secrets
@@ -17,7 +19,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from markupsafe import Markup, escape
 
 from recon_pipeline import canonical_domain, redact_url
@@ -152,6 +154,84 @@ def read_results(app: Flask, stored_dir: str | None) -> dict[str, Any]:
         return data
     except sqlite3.Error:
         return empty
+
+
+REPORT_SECTIONS = (
+    ("Assets", "assets", "hostname,source,resolved,first_seen", "hostname"),
+    ("Domain information", "domain_info", "key,value,source", "key,value"),
+    ("DNS records", "dns_records", "hostname,type,value,source", "hostname,type,value"),
+    ("Open ports", "ports", "hostname,ip,port,protocol,service,source", "hostname,port"),
+    ("Web services", "http_services", "url,host,status,title,server,technologies,content_type,content_length,ip,final_url", "host,url"),
+    ("Scanner observations", "findings", "severity,name,template_id,matched_at,host,tool,evidence", "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,name"),
+    ("Discovered endpoints", "endpoints", "url,host,path,query_keys,extension,source,first_seen", "host,path,url"),
+    ("Input surface", "input_points", "page_url,action_url,method,name,input_type,tested,reflection_context", "page_url,name"),
+    ("Encoded and hashed values", "encoded_artifacts", "source_url,location,kind,value_preview,decoded_preview,is_hash,analyzer", "source_url,location"),
+    ("Discovered repositories", "repositories", "url,host,source,scanned", "url"),
+    ("Tool execution ledger", "tool_runs", "stage,tool,started_at,duration,exit_code,status", "id"),
+)
+
+REPORT_URL_FIELDS = {"url", "final_url", "matched_at", "page_url", "action_url", "source_url"}
+REPORT_BOOLEAN_FIELDS = {"resolved", "tested", "is_hash", "scanned"}
+
+
+def markdown_cell(value: Any, field: str = "") -> str:
+    """Render one safe, single-line Markdown table cell."""
+    if value is None or value == "":
+        return "—"
+    if field in REPORT_BOOLEAN_FIELDS:
+        return "yes" if bool(value) else "no"
+    text = redact_url(str(value)) if field in REPORT_URL_FIELDS else str(value)
+    text = html.escape(text, quote=False)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
+
+
+def markdown_table(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "_No data collected._\n"
+    fields = list(rows[0].keys())
+    labels = [field.replace("_", " ").title() for field in fields]
+    lines = ["| " + " | ".join(labels) + " |", "| " + " | ".join("---" for _ in fields) + " |"]
+    lines.extend("| " + " | ".join(markdown_cell(row[field], field) for field in fields) + " |" for row in rows)
+    return "\n".join(lines) + "\n"
+
+
+def build_markdown_report(app: Flask, stored_dir: str | None, scan: sqlite3.Row, domain: str) -> str | None:
+    """Build a complete, portable report from a completed scan database."""
+    db_path = result_database(app, stored_dir)
+    if not db_path:
+        return None
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        db.row_factory = sqlite3.Row
+        run = db.execute("SELECT id,domain,profile,started_at,finished_at,status FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        if not run:
+            db.close()
+            return None
+        collected = []
+        for title, table, columns, order in REPORT_SECTIONS:
+            rows = db.execute(f"SELECT {columns} FROM {table} WHERE run_id=? ORDER BY {order}", (run["id"],)).fetchall()
+            collected.append((title, rows))
+        db.close()
+    except sqlite3.Error:
+        return None
+
+    generated = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    lines = [
+        f"# Reconnaissance report: {domain}", "",
+        "> Authorized attack-surface inventory. Automated observations require manual validation.", "",
+        "## Scan details", "",
+        f"- **Target:** {markdown_cell(domain)}", f"- **Scan ID:** {scan['id']}",
+        f"- **Profile:** {markdown_cell(run['profile'])}", f"- **Status:** {markdown_cell(run['status'])}",
+        f"- **Started:** {markdown_cell(run['started_at'])}",
+        f"- **Finished:** {markdown_cell(run['finished_at'] or scan['finished_at'])}",
+        f"- **Report generated:** {generated}", "", "## Summary", "",
+        "| Category | Count |", "| --- | ---: |",
+    ]
+    lines.extend(f"| {title} | {len(rows)} |" for title, rows in collected)
+    for title, rows in collected:
+        lines.extend(["", f"## {title}", "", markdown_table(rows).rstrip()])
+    lines.extend(["", "---", "", "Sensitive URL query values are redacted. Raw evidence remains in the protected scan workspace.", ""])
+    return "\n".join(lines)
 
 
 class ScanWorker:
@@ -327,6 +407,24 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             latest_complete = db.execute("SELECT * FROM scans WHERE target_id=? AND status='complete' ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
         results = read_results(app, latest_complete["result_dir"] if latest_complete else None)
         return render_template("target.html", target=target, scans=scans, active_scan=active_scan, latest_complete=latest_complete, results=results)
+
+    @app.get("/targets/<int:target_id>/report.md")
+    @login_required
+    def download_markdown_report(target_id: int) -> Any:
+        with connect_db(Path(app.config["CONTROL_DB"])) as db:
+            target = db.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+            if not target:
+                abort(404)
+            scan = db.execute("SELECT * FROM scans WHERE target_id=? AND status='complete' ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
+        if not scan:
+            abort(404, "No completed scan is available")
+        report = build_markdown_report(app, scan["result_dir"], scan, target["domain"])
+        if report is None:
+            abort(404, "Completed scan results are unavailable")
+        response = Response(report, content_type="text/markdown; charset=utf-8")
+        response.headers["Content-Disposition"] = f'attachment; filename="{target["domain"]}-recon-scan-{scan["id"]}.md"'
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     @app.post("/targets/<int:target_id>/scan")
     @login_required

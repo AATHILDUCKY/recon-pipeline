@@ -51,7 +51,7 @@ venv/bin/python webapp.py
 
 3. Open `http://127.0.0.1:8080` and sign in with the credentials from `.env`.
 
-Adding one or more targets automatically creates background scan jobs. Jobs are processed one at a time to avoid multiplying load against target infrastructure; browser requests remain responsive while scans run. Control data is stored in `instance/control.sqlite3`, logs in `instance/logs/`, and per-job evidence under `results/web/`. A service restart preserves queued jobs and marks an interrupted running job as failed so it can be deliberately requeued.
+Adding one or more targets automatically creates background scan jobs. Jobs are processed one at a time to avoid multiplying load against target infrastructure; browser requests remain responsive while scans run. Once a scan completes, its target page offers a downloadable Markdown report containing the complete normalized recon inventory. Control data is stored in `instance/control.sqlite3`, logs in `instance/logs/`, and per-job evidence under `results/web/`. A service restart preserves queued jobs and marks an interrupted running job as failed so it can be deliberately requeued.
 
 Every submission requires confirmation of written authorization. The default binding is local-only, sessions are HTTP-only and same-site, POST requests use CSRF tokens, scanner commands never invoke a shell, and web credentials are removed from scanner subprocess environments. For remote deployment, keep exactly one background worker (or move it into a dedicated service), place the web process behind an HTTPS reverse proxy, and set `SESSION_COOKIE_SECURE=true`.
 

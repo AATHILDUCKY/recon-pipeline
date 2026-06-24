@@ -49,6 +49,9 @@ GO_TOOLS = {
     "gau": "github.com/lc/gau/v2/cmd/gau@v2.2.4",
     "waybackurls": "github.com/tomnomnom/waybackurls@v0.1.0",
     "ffuf": "github.com/ffuf/ffuf/v2@latest",
+    "gobuster": "github.com/OJ/gobuster/v3@v3.8.2",
+    "jsminer": "github.com/tavgar/JSMiner/cmd/jsminer@latest",
+    "subjack": "github.com/haccer/subjack@latest",
     "dalfox": "github.com/hahwul/dalfox/v2@latest",
 }
 

@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "2.0.0"
+FFUF_VALID_STATUSES = frozenset((*range(200, 300), 301, 302, 307, 308, 401, 403, 405))
+WHATWEB_METADATA_PLUGINS = {"country","email","html5","httpserver","ip","passwordfield","script","title","uncommonheaders"}
 DOMAIN_RE = re.compile(r"(?=^.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.I)
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
 SECRET_QUERY_KEYS = {"access_token", "api_key", "apikey", "auth", "authorization", "client_secret", "key", "password", "secret", "sig", "signature", "token"}
@@ -110,7 +112,7 @@ class Database:
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, domain TEXT, profile TEXT, started_at TEXT, finished_at TEXT, status TEXT, config_json TEXT);
         CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, source TEXT, resolved INTEGER DEFAULT 0, first_seen TEXT, UNIQUE(run_id,hostname), FOREIGN KEY(run_id) REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS dns_records(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, type TEXT, value TEXT, source TEXT, UNIQUE(run_id,hostname,type,value));
-        CREATE TABLE IF NOT EXISTS ports(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, ip TEXT, port INTEGER, protocol TEXT, service TEXT, source TEXT, UNIQUE(run_id,hostname,ip,port,protocol));
+        CREATE TABLE IF NOT EXISTS ports(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, ip TEXT, port INTEGER, protocol TEXT, service TEXT, state TEXT, reason TEXT, product TEXT, version TEXT, extra_info TEXT, cpe TEXT, scripts TEXT, source TEXT, UNIQUE(run_id,hostname,ip,port,protocol));
         CREATE TABLE IF NOT EXISTS http_services(id INTEGER PRIMARY KEY, run_id INTEGER, url TEXT, host TEXT, status INTEGER, title TEXT, server TEXT, technologies TEXT, content_type TEXT, content_length INTEGER, ip TEXT, final_url TEXT, raw_json TEXT, UNIQUE(run_id,url));
         CREATE TABLE IF NOT EXISTS endpoints(id INTEGER PRIMARY KEY, run_id INTEGER, url TEXT, host TEXT, path TEXT, query_keys TEXT, extension TEXT, source TEXT, first_seen TEXT, UNIQUE(run_id,url));
         CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, run_id INTEGER, tool TEXT, severity TEXT, template_id TEXT, name TEXT, matched_at TEXT, host TEXT, evidence TEXT, UNIQUE(run_id,tool,template_id,matched_at));
@@ -121,6 +123,9 @@ class Database:
         CREATE TABLE IF NOT EXISTS tool_runs(id INTEGER PRIMARY KEY, run_id INTEGER, stage TEXT, tool TEXT, command_json TEXT, started_at TEXT, duration REAL, exit_code INTEGER, status TEXT, stdout_path TEXT, stderr_path TEXT);
         CREATE INDEX IF NOT EXISTS idx_assets_host ON assets(run_id,hostname); CREATE INDEX IF NOT EXISTS idx_endpoints_host ON endpoints(run_id,host);
         """)
+        port_columns={row[1] for row in self.conn.execute("PRAGMA table_info(ports)")}
+        for name in ("state","reason","product","version","extra_info","cpe","scripts"):
+            if name not in port_columns:self.conn.execute(f"ALTER TABLE ports ADD COLUMN {name} TEXT")
         self.conn.commit()
 
     def start(self, domain: str, profile: str, config: dict[str, Any]) -> int:
@@ -251,7 +256,7 @@ class Pipeline:
         self.raw.mkdir(parents=True); self.inputs.mkdir()
         self.db = Database(self.root / "recon.sqlite3")
         self.run_id = self.db.start(cfg.domain, cfg.profile, dataclasses.asdict(cfg) | {"output": str(cfg.output), "wordlist": str(cfg.wordlist) if cfg.wordlist else None, "skip": sorted(cfg.skip)})
-        self.done = 0; self.total = 19 if cfg.profile == "deep" else (5 if cfg.profile == "passive" else 12)
+        self.done = 0; self.total = 24 if cfg.profile == "deep" else (6 if cfg.profile == "passive" else 15)
         self.encoded_analyzed=0
         self.pipeline_started=time.monotonic()
 
@@ -274,9 +279,10 @@ class Pipeline:
                 return found
         return None
 
-    async def run_tool(self, stage: str, name: str, args: list[str], timeout: int | None = None, stdin: Path | None = None, executable: str | None = None, env: dict[str,str] | None = None, cwd: Path | None = None) -> tuple[int, Path]:
+    async def run_tool(self, stage: str, name: str, args: list[str], timeout: int | None = None, stdin: Path | None = None, executable: str | None = None, env: dict[str,str] | None = None, cwd: Path | None = None, artifact_name: str | None = None, success_codes: set[int] | None = None) -> tuple[int, Path]:
         exe = executable or self.tool(name)
-        out = self.raw / f"{stage}-{name}.stdout"; err = self.raw / f"{stage}-{name}.stderr"
+        artifact = re.sub(r"[^A-Za-z0-9_.-]+", "-", artifact_name or name).strip("-") or name
+        out = self.raw / f"{stage}-{artifact}.stdout"; err = self.raw / f"{stage}-{artifact}.stderr"
         if not exe or name in self.cfg.skip:
             self.log(f"{stage}: {name} unavailable/skipped", "yellow")
             self.db.execute("INSERT INTO tool_runs(run_id,stage,tool,command_json,started_at,duration,exit_code,status,stdout_path,stderr_path) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.run_id,stage,name,json.dumps(args),utcnow(),0,None,"skipped",str(out),str(err))); self.db.conn.commit()
@@ -287,7 +293,7 @@ class Pipeline:
             proc = await asyncio.create_subprocess_exec(*command, stdin=input_fh, stdout=stdout, stderr=stderr, start_new_session=True,env=env,cwd=cwd)
             try:
                 code = await asyncio.wait_for(proc.wait(), timeout=timeout or self.cfg.timeout * 20)
-                status = "ok" if code == 0 else "failed"
+                status = "ok" if code in (success_codes or {0}) else "failed"
             except asyncio.TimeoutError:
                 os.killpg(proc.pid, signal.SIGTERM)
                 try: await asyncio.wait_for(proc.wait(), 3)
@@ -457,8 +463,77 @@ class Pipeline:
                 if values: self.db.execute("UPDATE assets SET resolved=1 WHERE run_id=? AND hostname=?",(self.run_id,host))
         self.db.conn.commit(); self.done += 1
 
+    async def active_dns_enumeration(self) -> None:
+        """Resolve common subdomain labels with bundled Gobuster before dnsx."""
+        base=Path(__file__).resolve().parent
+        wordlist=base/"wordlists/subdomains-top1million-5000.txt"
+        if not wordlist.is_file():
+            self.log("01-active-dns: bundled subdomain wordlist unavailable","yellow");self.done+=1;return
+        workers=min(self.cfg.concurrency,max(1,self.cfg.rate),50)
+        delay_ms=max(1,math.ceil(1000*workers/self.cfg.rate))
+        with wordlist.open(errors="replace") as handle:
+            word_count=sum(1 for line in handle if line.strip() and not line.lstrip().startswith("#"))
+        stage_timeout=max(1800,math.ceil(word_count/max(1,self.cfg.rate))*2+self.cfg.timeout*2)
+        args=["dns","--domain",self.cfg.domain,"--wordlist",str(wordlist),"--check-cname","--threads",str(workers),"--delay",f"{delay_ms}ms","--timeout",f"{self.cfg.timeout}s","--quiet","--no-progress","--no-color"]
+        _,out=await self.run_tool("01-active-dns","gobuster",args,timeout=stage_timeout)
+        for raw in out.read_text(errors="replace").splitlines() if out.exists() else []:
+            line=re.sub(r"\x1b\[[0-9;]*m","",raw).strip()
+            if not line:continue
+            host=line.split(None,1)[0].lower().rstrip(".")
+            if not in_scope_host(host,self.cfg.domain) or not DOMAIN_RE.fullmatch(host):continue
+            self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,resolved,first_seen) VALUES(?,?,?,?,?)",(self.run_id,host,"gobuster-dns",1,utcnow()))
+            remainder=line[len(line.split(None,1)[0]):].strip();cname=""
+            if " CNAME: " in " "+remainder:
+                remainder,cname=(" "+remainder).split(" CNAME: ",1);remainder=remainder.strip()
+            for candidate in remainder.replace(","," ").split():
+                try:ipaddress.ip_address(candidate)
+                except ValueError:continue
+                typ="AAAA" if ":" in candidate else "A"
+                self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,typ,candidate,"gobuster-dns"))
+            if cname:
+                self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,"CNAME",cname.rstrip("."),"gobuster-dns"))
+        self.db.conn.commit();self.done+=1
+
+    async def archive_discovery(self) -> None:
+        """Feed historical URLs and hosts into deep DNS/HTTP discovery."""
+        inp=self.write_input("archive-domains.txt",[self.cfg.domain])
+        code,out=await self.run_tool("01-archive","waybackurls",[],timeout=1800,stdin=inp)
+        discovered=[];hosts=set()
+        if out.exists():
+            for line in out.read_text(errors="replace").splitlines():
+                url=canonical_url(line.strip(),self.cfg.domain)
+                if not url:continue
+                discovered.append(url)
+                host=urllib.parse.urlsplit(url).hostname
+                if host:hosts.add(host)
+        for host in sorted(hosts):
+            self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"waybackurls",utcnow()))
+        def priority(url: str) -> tuple[int,str]:
+            parsed=urllib.parse.urlsplit(url);ext=Path(parsed.path).suffix.lower()
+            return (0 if ext in {".js",".mjs",".map",".json"} else (1 if parsed.query else 2),url)
+        archive_budget=max(1,self.cfg.max_urls//2)
+        for url in sorted(set(discovered),key=priority)[:archive_budget]:self.add_endpoint(url,"waybackurls")
+        self.db.conn.commit();self.done+=1
+
+    def ingest_subjack(self, path: Path, hosts: set[str]) -> None:
+        try:data=json.loads(path.read_text(errors="replace"))
+        except (OSError,json.JSONDecodeError):return
+        if isinstance(data,dict):
+            records=data.get("results",data.get("findings",[data]))
+        else:records=data
+        if not isinstance(records,list):return
+        signals=("vulnerable","takeover","claimable","dangling","stale a record","zone transfer","expired")
+        for item in records:
+            if not isinstance(item,dict):continue
+            host=str(item.get("subdomain") or item.get("domain") or item.get("host") or "").lower().rstrip(".")
+            text=json.dumps(item,sort_keys=True);low=text.lower()
+            positive=item.get("vulnerable") is True or (item.get("vulnerable") is not False and "not vulnerable" not in low and any(x in low for x in signals))
+            if host in hosts and in_scope_host(host,self.cfg.domain) and positive:
+                service=str(item.get("service") or item.get("type") or "unknown service")
+                self.add_tool_finding("subjack","high",f"Potential subdomain takeover: {service}",f"https://{host}/",text)
+
     async def takeover_checks(self) -> None:
-        hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=?",(self.run_id,));inp=self.write_input("all-subdomains.txt",hosts)
+        hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=?",(self.run_id,));host_set=set(hosts);inp=self.write_input("all-subdomains.txt",hosts)
         self.log(f"03-takeover: checking {len(hosts)} discovered hosts")
         base=Path(__file__).resolve().parent;subover=self.tool("subover");subout=self.raw/"takeover-subover.txt"
         if subover and "subover" not in self.cfg.skip:
@@ -468,6 +543,11 @@ class Pipeline:
             for line in evidence.splitlines():
                 if any(word in line.lower() for word in ("vulnerable","takeover","can be claimed")):
                     host=next((h for h in hosts if h in line),self.cfg.domain);self.add_tool_finding("subover","high","Potential subdomain takeover",f"https://{host}/",line)
+        subjack=self.tool("subjack");subjack_out=self.raw/"takeover-subjack.json"
+        if self.cfg.profile=="deep" and subjack and "subjack" not in self.cfg.skip:
+            workers=min(25,self.cfg.concurrency,max(1,self.cfg.rate))
+            await self.run_tool("03-takeover","subjack",["-w",str(inp),"-a","-ssl","-ns","-mail","-t",str(workers),"-timeout",str(self.cfg.timeout),"-o",str(subjack_out)],timeout=3600,executable=subjack)
+            if subjack_out.exists():self.ingest_subjack(subjack_out,host_set)
         if self.tool("nuclei") and "nuclei" not in self.cfg.skip:
             code,out=await self.run_tool("03-takeover","nuclei-takeover",["-l",str(inp),"-tags","takeover","-jsonl","-silent","-rl",str(min(self.cfg.rate,25)),"-c",str(min(self.cfg.concurrency,10)),"-timeout",str(self.cfg.timeout),"-retries","1","-or"],timeout=1800,executable=self.tool("nuclei"))
             for row in json_lines(out):
@@ -487,30 +567,57 @@ class Pipeline:
                 self.db.execute("INSERT OR IGNORE INTO ports(run_id,hostname,ip,port,protocol,service,source) VALUES(?,?,?,?,?,?,?)",(self.run_id,host,ip,int(row.get("port",0)),str(row.get("protocol","tcp")),"","naabu"))
         self.db.conn.commit()
         open_ports=sorted({int(x) for x in self.db.values("SELECT port FROM ports WHERE run_id=?",(self.run_id,))})
-        if open_ports and self.tool("nmap") and "nmap" not in self.cfg.skip:
-            nmap_out=self.raw/"03-ports-nmap.xml"
-            ncode,nstdout=await self.run_tool("03-services","nmap",["-Pn","-n","-sV","--version-light","-T3","--host-timeout","10m","-p",",".join(map(str,open_ports)),"-iL",str(inp),"-oX","-"],timeout=3600)
-            if ncode==0:
-                nmap_out.write_bytes(nstdout.read_bytes())
-                try:
-                    root=ET.parse(nstdout).getroot()
-                    for host_node in root.findall("host"):
-                        addr_node=host_node.find("address[@addrtype='ipv4']")
-                        if addr_node is None: addr_node=host_node.find("address")
-                        ip=addr_node.get("addr","") if addr_node is not None else ""
-                        for port_node in host_node.findall("./ports/port"):
-                            service=port_node.find("service"); parts=[]
-                            if service is not None:
-                                parts=[service.get(k,"") for k in ("name","product","version","extrainfo")]
-                            label=" ".join(x for x in parts if x)
-                            self.db.execute("UPDATE ports SET service=?,source='naabu+nmap' WHERE run_id=? AND ip=? AND port=?",(label,self.run_id,ip,int(port_node.get("portid","0"))))
-                except ET.ParseError:
-                    self.log("03-services: could not parse nmap XML; raw output preserved","yellow")
+        ips=self.db.values("SELECT value FROM dns_records WHERE run_id=? AND type IN ('A','AAAA') UNION SELECT ip FROM ports WHERE run_id=? AND ip!='' ORDER BY 1",(self.run_id,self.run_id))
+        if ips and self.tool("nmap") and "nmap" not in self.cfg.skip:
+            families=(("ipv4",[ip for ip in ips if ":" not in ip]),("ipv6",[ip for ip in ips if ":" in ip]))
+            for family,family_ips in families:
+                if not family_ips:continue
+                ip_input=self.write_input(f"resolved-{family}.txt",family_ips);family_args=["-6"] if family=="ipv6" else []
+                if self.cfg.profile=="deep":
+                    nmap_args=family_args+["-Pn","-n","-sT","-sV","--version-intensity","7","-sC","--script-timeout","2m","-T3","--max-rate",str(self.cfg.rate),"--max-retries","2","--host-timeout","45m","--open","-p-","-iL",str(ip_input),"-oX","-"]
+                    nmap_timeout=max(7200,math.ceil(65535*len(family_ips)/max(1,self.cfg.rate))*2+self.cfg.timeout)
+                elif open_ports:
+                    nmap_args=family_args+["-Pn","-n","-sT","-sV","--version-light","-T3","--max-rate",str(self.cfg.rate),"--max-retries","2","--host-timeout","15m","--open","-p",",".join(map(str,open_ports)),"-iL",str(ip_input),"-oX","-"]
+                    nmap_timeout=3600
+                else:continue
+                ncode,nstdout=await self.run_tool("03-services","nmap",nmap_args,timeout=nmap_timeout,artifact_name=f"nmap-{family}-detailed")
+                if ncode==0:self.ingest_nmap_xml(nstdout)
         self.db.conn.commit(); self.done+=1
+
+    def ingest_nmap_xml(self, path: Path) -> None:
+        try:root=ET.parse(path).getroot()
+        except (OSError,ET.ParseError):self.log("03-services: could not parse nmap XML; raw output preserved","yellow");return
+        for host_node in root.findall("host"):
+            status_node=host_node.find("status")
+            if status_node is not None and str(status_node.get("state") or "up")=="down":continue
+            addresses=[node.get("addr","") for node in host_node.findall("address") if node.get("addrtype") in {"ipv4","ipv6"} and node.get("addr")]
+            xml_names={str(node.get("name") or "").lower().rstrip(".") for node in host_node.findall("./hostnames/hostname")}
+            host_scripts={str(node.get("id") or ""):str(node.get("output") or "")[:4000] for node in host_node.findall("./hostscript/script") if node.get("id")}
+            for ip in addresses:
+                mapped=set(self.db.values("SELECT hostname FROM dns_records WHERE run_id=? AND type IN ('A','AAAA') AND value=?",(self.run_id,ip)))
+                mapped.update(name for name in xml_names if in_scope_host(name,self.cfg.domain) and DOMAIN_RE.fullmatch(name))
+                for port_node in host_node.findall("./ports/port"):
+                    state_node=port_node.find("state");state=str(state_node.get("state") or "") if state_node is not None else ""
+                    if state!="open":continue
+                    port=int(port_node.get("portid","0"));protocol=str(port_node.get("protocol") or "tcp")
+                    service_node=port_node.find("service");attrs=service_node.attrib if service_node is not None else {}
+                    service=str(attrs.get("name") or "");tunnel=str(attrs.get("tunnel") or "")
+                    if tunnel and tunnel not in service:service=f"{tunnel}/{service}" if service else tunnel
+                    product=str(attrs.get("product") or "");version=str(attrs.get("version") or "");extra=str(attrs.get("extrainfo") or "")
+                    cpes=sorted({str(node.text or "") for node in port_node.findall("./service/cpe") if node.text})
+                    scripts=dict(host_scripts);scripts.update({str(node.get("id") or ""):str(node.get("output") or "")[:4000] for node in port_node.findall("script") if node.get("id")})
+                    reason=str(state_node.get("reason") or "") if state_node is not None else ""
+                    label=" ".join(x for x in (service,product,version,extra) if x)
+                    for hostname in sorted(mapped):
+                        self.db.execute("""INSERT INTO ports(run_id,hostname,ip,port,protocol,service,state,reason,product,version,extra_info,cpe,scripts,source)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,hostname,ip,port,protocol) DO UPDATE SET
+                          service=excluded.service,state=excluded.state,reason=excluded.reason,product=excluded.product,version=excluded.version,
+                          extra_info=excluded.extra_info,cpe=excluded.cpe,scripts=excluded.scripts,source='naabu+nmap'""",
+                          (self.run_id,hostname,ip,port,protocol,label,state,reason,product,version,extra,json.dumps(cpes),json.dumps(scripts,sort_keys=True),"nmap"))
 
     async def probe(self) -> None:
         hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=? AND resolved=1",(self.run_id,)); inp=self.write_input("http-targets.txt",hosts)
-        args=["-l",str(inp),"-json","-silent","-sc","-title","-server","-td","-ct","-cl","-ip","-location","-fr","-rl",str(self.cfg.rate),"-t",str(self.cfg.concurrency),"-timeout",str(self.cfg.timeout)]
+        args=["-l",str(inp),"-json","-silent","-sc","-title","-server","-td","-ct","-cl","-ip","-cname","-cdn","-location","-fr","-rl",str(self.cfg.rate),"-t",str(self.cfg.concurrency),"-timeout",str(self.cfg.timeout)]
         if self.cfg.screenshots:
             args += ["-ss", "-esb", "-ehb", "-srd", str(self.raw / "screenshots")]
         code,out=await self.run_tool("04-http","httpx",args,timeout=3600)
@@ -518,7 +625,9 @@ class Pipeline:
             for row in json_lines(out):
                 url=canonical_url(str(row.get("url") or row.get("input") or ""),self.cfg.domain)
                 if not url: continue
-                p=urllib.parse.urlsplit(url); tech=row.get("tech",[])
+                p=urllib.parse.urlsplit(url);tech=row.get("tech",[]);tech=tech if isinstance(tech,list) else [tech]
+                cdn_raw=row.get("cdn_name") or row.get("cdn") or "";cdn_name=str(cdn_raw).strip() if isinstance(cdn_raw,str) else "";cdn_type=str(row.get("cdn_type") or "").strip()
+                if cdn_name:tech.append((cdn_type.upper()+":" if cdn_type else "CDN:")+cdn_name)
                 self.db.execute("INSERT OR REPLACE INTO http_services(run_id,url,host,status,title,server,technologies,content_type,content_length,ip,final_url,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(self.run_id,url,p.hostname,int(row.get("status_code") or 0),str(row.get("title") or ""),str(row.get("webserver") or ""),json.dumps(tech),str(row.get("content_type") or ""),int(row.get("content_length") or 0),str(row.get("host_ip") or row.get("ip") or ""),str(row.get("final_url") or row.get("location") or ""),json.dumps(row)))
                 self.add_endpoint(url,"httpx")
         self.db.conn.commit(); self.done+=1
@@ -543,11 +652,11 @@ class Pipeline:
 
     async def crawl(self) -> None:
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=?",(self.run_id,)); inp=self.write_input("live-urls.txt",urls)
-        jobs=[self.run_tool("05-crawl","katana",["-list",str(inp),"-jsonl","-silent","-jc","-kf","all","-fx","-d",str(self.cfg.depth),"-rl",str(self.cfg.rate),"-c",str(min(self.cfg.concurrency,20)),"-p","5","-mdp",str(max(10,self.cfg.max_urls//max(1,len(urls)))),"-fs","rdn","-do"],timeout=3600)]
-        if self.tool("gau"): jobs.append(self.run_tool("05-archive","gau",["--subs",self.cfg.domain],timeout=1800))
-        if self.tool("waybackurls"): jobs.append(self.run_tool("05-wayback","waybackurls",[],timeout=1800,stdin=self.write_input("apex.txt",[self.cfg.domain])))
-        results=await asyncio.gather(*jobs)
-        for (_,path),source in zip(results,["katana","gau","waybackurls"]):
+        jobs=[("katana",self.run_tool("05-crawl","katana",["-list",str(inp),"-jsonl","-silent","-jc","-kf","all","-fx","-d",str(self.cfg.depth),"-rl",str(self.cfg.rate),"-c",str(min(self.cfg.concurrency,20)),"-p","5","-mdp",str(max(10,self.cfg.max_urls//max(1,len(urls)))),"-fs","rdn","-do"],timeout=3600))]
+        if self.tool("gau"):jobs.append(("gau",self.run_tool("05-archive","gau",["--subs",self.cfg.domain],timeout=1800)))
+        if self.cfg.profile!="deep" and self.tool("waybackurls"):jobs.append(("waybackurls",self.run_tool("05-wayback","waybackurls",[],timeout=1800,stdin=self.write_input("apex.txt",[self.cfg.domain]))))
+        results=await asyncio.gather(*(job for _,job in jobs))
+        for (source,_),(_,path) in zip(jobs,results):
             for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
                 if line.startswith("{"):
                     try:
@@ -557,10 +666,35 @@ class Pipeline:
                 if line.startswith("http"): self.add_endpoint(line,source)
         self.db.conn.execute("DELETE FROM endpoints WHERE id NOT IN (SELECT MIN(id) FROM endpoints WHERE run_id=? GROUP BY url) AND run_id=?",(self.run_id,self.run_id)); self.db.conn.commit(); self.done+=1
 
+    async def javascript_analysis(self) -> None:
+        rows=self.db.conn.execute("SELECT url FROM endpoints WHERE run_id=? AND extension IN ('js','mjs') ORDER BY url LIMIT ?",(self.run_id,min(1000,self.cfg.secret_max_files))).fetchall()
+        targets=[str(row["url"]) for row in rows]
+        miner=self.tool("jsminer")
+        if not targets or not miner or "jsminer" in self.cfg.skip:
+            self.log("07-jsminer: no JavaScript targets or bundled tool unavailable/skipped","yellow");self.done+=1;return
+        inp=self.write_input("jsminer-targets.txt",targets)
+        _,out=await self.run_tool("07-jsminer","jsminer",["-quiet","-safe","-endpoints","-external=false","-render=false","-insecure=false","-show-source","-timeout",str(self.cfg.timeout),"-targets",str(inp)],timeout=3600,executable=miner,success_codes={0,1})
+        try:data=json.loads(out.read_text(errors="replace"))
+        except (OSError,json.JSONDecodeError):data=[]
+        records=data if isinstance(data,list) else ([data] if isinstance(data,dict) else [])
+        for item in records:
+            if not isinstance(item,dict):continue
+            source=canonical_url(str(item.get("source") or ""),self.cfg.domain)
+            value=str(item.get("value") or item.get("endpoint") or item.get("url") or "").strip()
+            if not source or not value or any(x in value for x in ("${","{{","<",">","\\","\n","\r"," ")):continue
+            self.add_repository(value,"jsminer")
+            found=canonical_url(urllib.parse.urljoin(source,value),self.cfg.domain)
+            if found:self.add_endpoint(found,"jsminer")
+        self.db.conn.commit();self.done+=1
+
     async def technologies(self) -> None:
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=?",(self.run_id,)); inp=self.write_input("live-urls.txt",urls)
         output=self.raw/"whatweb.json"
-        await self.run_tool("06-tech","whatweb",["--log-json="+str(output),"--no-errors","--aggression=1","--input-file="+str(inp)],timeout=1800)
+        aggression=3 if self.cfg.profile=="deep" else 1
+        args=["--log-json="+str(output),"--no-errors",f"--aggression={aggression}","--follow-redirect=same-site",f"--open-timeout={self.cfg.timeout}",f"--read-timeout={self.cfg.timeout}",f"--user-agent=ReconPipeline/{VERSION} authorized-technology-inventory","--input-file="+str(inp)]
+        if self.cfg.profile=="deep":args += ["--max-threads=1",f"--wait={max(0.01,1/self.cfg.rate):.3f}"]
+        else:args += [f"--max-threads={min(25,self.cfg.concurrency,self.cfg.rate)}"]
+        await self.run_tool("06-tech","whatweb",args,timeout=3600 if self.cfg.profile=="deep" else 1800)
         if output.exists():
             try:data=json.loads(output.read_text(errors="replace"))
             except json.JSONDecodeError:data=[]
@@ -569,6 +703,7 @@ class Pipeline:
                 if not url or not isinstance(plugins,dict):continue
                 labels=[]
                 for name,details in plugins.items():
+                    if str(name).lower() in WHATWEB_METADATA_PLUGINS:continue
                     versions=details.get("version",[]) if isinstance(details,dict) else []
                     versions=versions if isinstance(versions,list) else [versions]
                     label=str(name)+(":"+",".join(str(v) for v in versions if v) if any(versions) else "")
@@ -911,40 +1046,64 @@ class Pipeline:
 
     async def nuclei(self) -> None:
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=?",(self.run_id,)); inp=self.write_input("live-urls.txt",urls)
-        code,out=await self.run_tool("07-nuclei","nuclei",["-l",str(inp),"-jsonl","-silent","-severity","info,low,medium,high,critical","-rl",str(self.cfg.rate),"-c",str(min(self.cfg.concurrency,25)),"-timeout",str(self.cfg.timeout),"-retries","1","-or"],timeout=7200)
-        if code==0:
+        executable=self.tool("nuclei")
+        update_code,_=await self.run_tool("12-nuclei","nuclei",["-ut","-silent"],timeout=600,executable=executable,artifact_name="nuclei-template-update")
+        if update_code==0:
+            self.db.execute("INSERT OR IGNORE INTO domain_info(run_id,key,value,source) VALUES(?,?,?,?)",(self.run_id,"Vulnerability templates","Nuclei community templates checked for latest release at "+utcnow(),"nuclei"))
+        common=["-l",str(inp),"-jsonl","-silent","-rl",str(self.cfg.rate),"-c",str(min(self.cfg.concurrency,25)),"-timeout",str(self.cfg.timeout),"-retries","1","-or"]
+        general=await self.run_tool("12-nuclei","nuclei",common+["-severity","info,low,medium,high,critical"],timeout=7200,executable=executable,artifact_name="nuclei-general")
+        technology=await self.run_tool("12-nuclei","nuclei",common+["-as","-severity","low,medium,high,critical"],timeout=7200,executable=executable,artifact_name="nuclei-technology")
+        for (code,out),tool_name in ((general,"nuclei"),(technology,"nuclei-tech")):
+            if code!=0:continue
             for row in json_lines(out):
                 info=row.get("info",{}) or {}; matched=str(row.get("matched-at") or row.get("host") or "")
                 host=urllib.parse.urlsplit(matched).hostname or ""
                 if host and not in_scope_host(host,self.cfg.domain):continue
-                self.db.execute("INSERT OR IGNORE INTO findings(run_id,tool,severity,template_id,name,matched_at,host,evidence) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,"nuclei",str(info.get("severity","unknown")),str(row.get("template-id") or ""),str(info.get("name") or ""),matched,host,json.dumps(row)))
+                self.db.execute("INSERT OR IGNORE INTO findings(run_id,tool,severity,template_id,name,matched_at,host,evidence) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,tool_name,str(info.get("severity","unknown")),str(row.get("template-id") or ""),str(info.get("name") or ""),matched,host,json.dumps(row)))
         self.db.conn.commit();self.done+=1
 
     async def directories(self) -> None:
         word=self.cfg.wordlist
         if not word:
             base=Path(__file__).resolve().parent
-            choices=[base/"tools/wordlists/SecLists/Discovery/Web-Content/common.txt",base/"tools/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt",Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt"),Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt")]
+            choices=[base/"wordlists/web-discovery-common.txt",base/"tools/wordlists/SecLists/Discovery/Web-Content/common.txt",base/"tools/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt",Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt"),Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),Path("/usr/share/wordlists/SecLists/Discovery/Web-Content/raft-small-words.txt")]
             word=next((p for p in choices if p.exists()),None)
-        urls=self.db.values("SELECT url FROM http_services WHERE run_id=? ORDER BY url LIMIT 25",(self.run_id,))
-        self.log(f"content-discovery: FFUF against {len(urls)} live services")
-        if not word: self.log("08-content: no SecLists web wordlist found","yellow"); self.done+=1; return
+        rows=self.db.conn.execute("SELECT url FROM http_services WHERE run_id=? AND status BETWEEN 100 AND 599 ORDER BY host,url",(self.run_id,)).fetchall()
+        urls=[];seen=set()
+        for row in rows:
+            url=canonical_url(str(row["url"]),self.cfg.domain)
+            if not url:continue
+            parsed=urllib.parse.urlsplit(url);origin=urllib.parse.urlunsplit((parsed.scheme,parsed.netloc,"/","",""))
+            if origin not in seen:seen.add(origin);urls.append(origin)
+        self.log(f"content-discovery: bundled FFUF against all {len(urls)} live in-scope services at {self.cfg.rate} req/s")
+        if not word: self.log("08-content: no web discovery wordlist found","yellow"); self.done+=1; return
+        if not urls:self.log("08-content: no live web services to enumerate","yellow");self.done+=1;return
         for idx,url in enumerate(urls):
             base=url.rstrip("/")+"/FUZZ"; name=f"ffuf-{idx:03d}"
-            code,out=await self.run_tool("08-content", "ffuf", ["-u",base,"-w",str(word),"-json","-s","-ac","-ach","-recursion","-recursion-depth","1","-rate",str(self.cfg.rate),"-t",str(min(self.cfg.concurrency,40)),"-timeout",str(self.cfg.timeout),"-maxtime","300"])
-            if code==0:
-                for row in json_lines(out): self.add_endpoint(str(row.get("url") or ""),"ffuf")
+            args=["-u",base,"-w",str(word),"-json","-s","-noninteractive","-ac","-ach","-mc","200-299,301,302,307,308,401,403,405","-recursion","-recursion-depth",str(self.cfg.depth),"-rate",str(self.cfg.rate),"-t",str(min(self.cfg.concurrency,40)),"-timeout",str(self.cfg.timeout)]
+            code,out=await self.run_tool("08-content", "ffuf", args,timeout=max(3600,self.cfg.timeout*20),artifact_name=name)
+            for result in json_lines(out):
+                try:status=int(result.get("status") or 0)
+                except (TypeError,ValueError):continue
+                found=canonical_url(str(result.get("url") or ""),self.cfg.domain)
+                if found and status in FFUF_VALID_STATUSES:self.add_endpoint(found,"ffuf")
         self.db.conn.commit();self.done+=1
 
     async def run(self) -> None:
         status="failed"
         try:
-            await self.domain_intelligence();await self.recon_ng();await self.additional_osint();await self.enumerate(); await self.resolve();await self.dns_intelligence()
+            await self.domain_intelligence();await self.recon_ng();await self.additional_osint();await self.enumerate()
             if self.cfg.profile == "passive":
+                await self.resolve();await self.dns_intelligence()
                 self.report(); status="complete"; self.log(f"complete: {self.root}","green"); return
+            if self.cfg.profile=="deep":await self.archive_discovery()
+            await self.active_dns_enumeration()
+            await self.resolve();await self.dns_intelligence()
             await self.takeover_checks();await self.ports()
             await self.probe(); await self.crawl(); await self.technologies()
-            if self.cfg.profile == "deep":await self.parameter_discovery();await self.directories()
+            if self.cfg.profile == "deep":await self.parameter_discovery()
+            await self.directories()
+            if self.cfg.profile=="deep":await self.javascript_analysis()
             await self.secrets();await self.tls_checks()
             if self.cfg.profile == "deep":await self.input_checks();await self.repository_secrets();await self.xss_checks();await self.sqli_checks();await self.nuclei();await self.nikto_checks()
             self.report(); status="complete"; self.log(f"complete: {self.root}","green")

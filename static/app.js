@@ -1,7 +1,39 @@
 document.addEventListener('DOMContentLoaded',()=>{
   const monitor=document.querySelector('.scan-monitor');
-  if(monitor){const id=monitor.dataset.scanId,log=monitor.querySelector('[data-log]'),status=monitor.querySelector('[data-status]');let prior='';
-    const poll=async()=>{try{const r=await fetch(`/api/scans/${id}`,{headers:{Accept:'application/json'}});if(!r.ok)return;const d=await r.json();status.textContent=d.status;if(d.log){log.textContent=d.log;if(d.log!==prior){log.scrollTop=log.scrollHeight;prior=d.log}}if(['complete','failed','cancelled'].includes(d.status)){setTimeout(()=>location.reload(),700);return}}catch(e){}setTimeout(poll,2000)};poll()}
-  const tabs=document.querySelectorAll('[data-tab]');tabs.forEach(btn=>btn.addEventListener('click',()=>{tabs.forEach(x=>x.classList.toggle('active',x===btn));document.querySelectorAll('[data-pane]').forEach(x=>x.classList.toggle('hidden',x.dataset.pane!==btn.dataset.tab))}));
-  const filter=document.querySelector('[data-filter]');if(filter)filter.addEventListener('input',()=>{const q=filter.value.toLowerCase();document.querySelectorAll('[data-filter-list]>div').forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(q))});
+  if(document.querySelector('.sidebar')&&window.EventSource){
+    const params=monitor?`?scan_id=${encodeURIComponent(monitor.dataset.scanId)}`:'';
+    const stream=new EventSource(`/api/events${params}`);
+    const setConnectionState=(connected)=>document.querySelectorAll('[data-stream-state]').forEach(el=>{el.classList.toggle('offline',!connected);el.lastChild.textContent=connected?' Live':' Reconnecting…'});
+    stream.addEventListener('open',()=>setConnectionState(true));stream.addEventListener('error',()=>setConnectionState(false));
+    stream.addEventListener('workspace',event=>{
+      const data=JSON.parse(event.data);setConnectionState(true);
+      document.querySelectorAll('[data-live-metric]').forEach(el=>el.textContent=data.totals[el.dataset.liveMetric]||0);
+      data.latest.forEach(scan=>{
+        document.querySelectorAll(`[data-target-id="${scan.target_id}"]`).forEach(row=>{row.dataset.status=scan.status;const badge=row.querySelector('[data-target-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}});
+        document.querySelectorAll(`[data-scan-row="${scan.id}"]`).forEach(row=>{const badge=row.querySelector('[data-scan-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}const finished=row.querySelector('[data-scan-finished]');if(finished&&scan.finished_at)finished.textContent=scan.finished_at;const action=row.querySelector('[data-scan-action]');if(action){const done=scan.status==='complete';action.href=done?action.dataset.reportUrl:action.dataset.targetUrl;action.textContent=done?'View report →':'Open target →'}});
+      });
+      if(monitor&&data.tracked){const scan=data.tracked,status=monitor.querySelector('[data-status]'),log=monitor.querySelector('[data-log]');status.textContent=scan.status;if(scan.log&&log.textContent!==scan.log){log.textContent=scan.log;log.scrollTop=log.scrollHeight}if(['complete','failed','cancelled'].includes(scan.status)){stream.close();setTimeout(()=>location.reload(),500)}}
+    });
+    window.addEventListener('pagehide',()=>stream.close(),{once:true});
+  }
+
+  const tabs=document.querySelectorAll('[data-tab]');
+  tabs.forEach(btn=>btn.addEventListener('click',()=>{tabs.forEach(x=>x.classList.toggle('active',x===btn));document.querySelectorAll('[data-pane]').forEach(x=>x.classList.toggle('hidden',x.dataset.pane!==btn.dataset.tab));history.replaceState(null,'',`#${btn.dataset.tab}`)}));
+  const initial=location.hash.slice(1),initialTab=document.querySelector(`[data-tab="${CSS.escape(initial)}"]`);if(initialTab)initialTab.click();
+
+  document.querySelectorAll('[data-filter]').forEach(filter=>filter.addEventListener('input',()=>{const list=filter.dataset.filter,q=filter.value.toLowerCase();document.querySelectorAll(`[data-filter-list="${list}"]>.inventory-row,[data-filter-list="${list}"]>.tech-host-card,[data-filter-list="${list}"]>.ip-card`).forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(q))}));
+  const targetSearch=document.querySelector('[data-target-search]'),statusFilter=document.querySelector('[data-status-filter]');
+  const filterTargets=()=>document.querySelectorAll('[data-target-row]').forEach(row=>{const text=(targetSearch?.value||'').toLowerCase(),status=statusFilter?.value||'';row.hidden=!row.textContent.toLowerCase().includes(text)||(status&&row.dataset.status!==status)});
+  targetSearch?.addEventListener('input',filterTargets);statusFilter?.addEventListener('change',filterTargets);
+  document.querySelectorAll('[data-table-search]').forEach(input=>input.addEventListener('input',()=>{const key=input.dataset.tableSearch,q=input.value.toLowerCase();document.querySelectorAll(`[data-search-list="${key}"]>tr,[data-search-list="${key}"]>.report-card`).forEach(row=>row.hidden=!row.textContent.toLowerCase().includes(q))}));
+
+  const modal=document.querySelector('[data-modal]');
+  document.querySelectorAll('[data-open-modal]').forEach(x=>x.addEventListener('click',()=>{modal.hidden=false;modal.querySelector('textarea')?.focus()}));
+  document.querySelectorAll('[data-close-modal]').forEach(x=>x.addEventListener('click',()=>modal.hidden=true));
+  modal?.addEventListener('click',e=>{if(e.target===modal)modal.hidden=true});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal)modal.hidden=true});
+  document.querySelector('[data-menu]')?.addEventListener('click',()=>document.querySelector('.sidebar')?.classList.toggle('open'));
+  document.querySelectorAll('[data-rate]').forEach(x=>x.addEventListener('click',()=>{const input=document.querySelector('input[name="request_rate"]');if(input)input.value=x.dataset.rate}));
+  document.querySelectorAll('form[data-confirm]').forEach(form=>form.addEventListener('submit',event=>{if(!window.confirm(form.dataset.confirm))event.preventDefault()}));
+  if(modal&&new URLSearchParams(location.search).get('add')==='1'){modal.hidden=false;modal.querySelector('textarea')?.focus()}
 });

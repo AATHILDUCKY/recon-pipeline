@@ -8,9 +8,12 @@
 </head>
 <body>
   {% if session.authenticated %}
-  <header class="topbar"><a class="brand" href="{{ url_for('dashboard') }}"><span>R</span> Recon Console</a>
-    <form action="{{ url_for('logout') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-button">Sign out</button></form>
-  </header>
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('dashboard') }}"><span>R</span><div>Recon<span>Cloud</span></div></a>
+    <nav><p>Workspace</p><a class="nav-item {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"><i>⌂</i> Overview</a><a class="nav-item {% if request.endpoint in ('targets_index','target_detail') %}active{% endif %}" href="{{ url_for('targets_index') }}"><i>◎</i> Targets</a><a class="nav-item {% if request.endpoint == 'scan_activity' %}active{% endif %}" href="{{ url_for('scan_activity') }}"><i>↻</i> Scan activity</a><p>Intelligence</p><a class="nav-item {% if request.endpoint == 'attack_surface' %}active{% endif %}" href="{{ url_for('attack_surface') }}"><i>◈</i> Attack surface</a><a class="nav-item {% if request.endpoint in ('reports','scan_report') %}active{% endif %}" href="{{ url_for('reports') }}"><i>▤</i> Reports</a></nav>
+    <div class="sidebar-foot"><div class="workspace-avatar">RC</div><div><strong>Security workspace</strong><span>Administrator</span></div><form action="{{ url_for('logout') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="icon-button" title="Sign out">↪</button></form></div>
+  </aside>
+  <header class="topbar"><button class="menu-button" data-menu aria-label="Open navigation">☰</button><div class="breadcrumbs">ReconCloud <span>/</span> {% block breadcrumb %}Overview{% endblock %}</div><div class="top-actions"><span class="worker"><i></i> Scanner online</span><div class="avatar">AD</div></div></header>
   {% endif %}
   <main class="shell {% block shell_class %}{% endblock %}">
     {% for category, message in get_flashed_messages(with_categories=true) %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}

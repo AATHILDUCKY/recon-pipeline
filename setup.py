@@ -426,16 +426,21 @@ def install_go(dry_run: bool, force: bool) -> None:
 
 def write_env() -> None:
     destination = ROOT / ".env"
+    example = ROOT / ".env.example"
     if destination.exists():
         print("= .env: preserved")
-    else:
-        shutil.copy2(ROOT / ".env.example", destination)
+    elif example.exists():
+        shutil.copy2(example, destination)
         print("+ created .env from .env.example; change its secrets before starting the web app")
+    else:
+        print("! .env not created; provide .env or .env.example before starting the web app")
 
 
 def validate_project_files(parser: argparse.ArgumentParser) -> None:
-    required = [ROOT / "requirements.txt", ROOT / ".env.example"]
+    required = [ROOT / "requirements.txt"]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
+    if not (ROOT / ".env").is_file() and not (ROOT / ".env.example").is_file():
+        missing.append(".env or .env.example")
     if missing:
         parser.error("missing required project file(s): " + ", ".join(missing))
 

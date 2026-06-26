@@ -41,7 +41,6 @@ REPOSITORIES = {
     "sqlmap": ("https://github.com/sqlmapproject/sqlmap.git", "e1aac02ef2ca017e2dc5f4be8883db59d039295a"),
     "testssl.sh": ("https://github.com/testssl/testssl.sh.git", "b5a83f5f1087389ca2fd7b2872b8cbf438d05f91"),
     "theHarvester": ("https://github.com/laramies/theHarvester.git", "14d9f2999657f3285de78e5c42c66b626e84c2a1"),
-    "trufflehog": ("https://github.com/trufflesecurity/trufflehog.git", "9b6b5326bfe25dbd856eccc8a8275eb5dea7bd52"),
 }
 
 GO_TOOLS = {
@@ -60,9 +59,11 @@ GO_TOOLS = {
     "dalfox": "github.com/hahwul/dalfox/v2@latest",
 }
 
-OS_COMMANDS = ("git", "go", "nmap", "whatweb", "whois", "dig", "sslscan", "perl")
+OS_COMMANDS = ("git", "nmap", "whatweb", "whois", "dig", "sslscan", "perl")
 STAMP_NAME = ".recon-pipeline-install.json"
-SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra", "trufflehog": "trufflehog"}
+SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra"}
+TRUFFLEHOG_INSTALL_URL = "https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh"
+SOURCE_GO_BINARIES = {"gitleaks", "mantra", "subover"}
 WORDLIST_REPOSITORIES = {
     "SecLists": "https://github.com/danielmiessler/SecLists.git",
     "PayloadsAllTheThings": "https://github.com/swisskyrepo/PayloadsAllTheThings.git",
@@ -264,8 +265,8 @@ def missing_perl_modules(perl_root: Path, modules: tuple[str, ...]) -> list[str]
 
 
 def install_perl_tools(dry_run: bool, force: bool) -> None:
-    if not shutil.which("cpan"):
-        print("! cpan is unavailable; skipping Perl tool dependencies")
+    if not shutil.which("perl"):
+        print("! perl is unavailable; skipping Perl tool dependencies")
         return
     for name, source, perl_root, modules in PERL_TOOL_INTEGRATIONS:
         if not source.exists() and not dry_run:
@@ -273,6 +274,9 @@ def install_perl_tools(dry_run: bool, force: bool) -> None:
         missing = list(modules) if force else missing_perl_modules(perl_root, modules)
         if not missing:
             print(f"= {name} Perl dependencies: already satisfied")
+            continue
+        if not shutil.which("cpan"):
+            print(f"! cpan is unavailable; skipping {name} Perl dependencies")
             continue
         perl_root.mkdir(parents=True, exist_ok=True)
         (perl_root / "home").mkdir(parents=True, exist_ok=True)
@@ -406,22 +410,44 @@ def local_binary(name: str) -> Path | None:
 
 
 def install_go(dry_run: bool, force: bool) -> None:
-    if not shutil.which("go"):
-        print("! Go is unavailable; skipping Go-based tools")
-        return
-    BIN.mkdir(parents=True, exist_ok=True)
+    go_available = shutil.which("go") is not None
     env = os.environ.copy()
     env["GOBIN"] = str(BIN)
     for name, module in GO_TOOLS.items():
         if not force and binary_available(name):
             print(f"= {name}: already available")
-        else:
-            run(["go", "install", module], env=env, dry_run=dry_run)
-    for name, source in (("gitleaks", "gitleaks"), ("trufflehog", "trufflehog"), ("mantra", "mantra"), ("subover", "SubOver")):
+            continue
+        if not go_available:
+            print(f"! Go is unavailable; skipping {name}")
+            continue
+        BIN.mkdir(parents=True, exist_ok=True)
+        run(["go", "install", module], env=env, dry_run=dry_run)
+    for name, source in (("gitleaks", "gitleaks"), ("mantra", "mantra"), ("subover", "SubOver")):
         if not force and binary_available(name):
             print(f"= {name}: already available")
-        elif (TOOLS / source).exists() or dry_run:
+            continue
+        if not go_available:
+            print(f"! Go is unavailable; skipping {name}")
+            continue
+        if (TOOLS / source).exists() or dry_run:
+            BIN.mkdir(parents=True, exist_ok=True)
             run(["go", "build", "-o", str(BIN / name), "."], cwd=TOOLS / source, dry_run=dry_run)
+
+
+def install_trufflehog(dry_run: bool, force: bool) -> None:
+    if not force and binary_available("trufflehog"):
+        print("= trufflehog: already available")
+        return
+    if not shutil.which("curl"):
+        print("! curl is unavailable; skipping trufflehog installer")
+        return
+    BIN.mkdir(parents=True, exist_ok=True)
+    command = f"curl -sSfL {TRUFFLEHOG_INSTALL_URL} | sh -s -- -b {BIN}"
+    print("+", command)
+    if dry_run:
+        return
+    script = subprocess.run(["curl", "-sSfL", TRUFFLEHOG_INSTALL_URL], text=True, capture_output=True, check=True).stdout
+    subprocess.run(["sh", "-s", "--", "-b", str(BIN)], input=script, text=True, check=True)
 
 
 def write_env() -> None:
@@ -461,8 +487,10 @@ def print_missing(label: str, missing: list[str]) -> None:
 def status() -> int:
     search = [str(path) for path in LOCAL_BIN_DIRS] + os.environ.get("PATH", "").split(os.pathsep)
     missing = [name for name in OS_COMMANDS if not executable_in_search_path(name, search)]
-    managed = set(GO_TOOLS) | {"gitleaks", "trufflehog", "mantra", "subover"}
-    missing_managed = sorted(name for name in managed if not binary_available(name))
+    go_managed = set(GO_TOOLS) | SOURCE_GO_BINARIES
+    managed = go_managed | {"trufflehog"}
+    missing_go_managed = sorted(name for name in go_managed if not binary_available(name))
+    missing_installer_managed = ["trufflehog"] if not binary_available("trufflehog") else []
     missing_repositories = sorted(name for name in REPOSITORIES if not (TOOLS / name).exists())
     missing_wordlists = sorted(name for name in WORDLIST_REPOSITORIES if not (WORDLISTS / name).exists())
     app_missing = missing_requirements(python_executable(VENV), ROOT / "requirements.txt")
@@ -507,7 +535,8 @@ def status() -> int:
             else:
                 print(f"{name} Perl dependencies: satisfied")
     print_missing("Missing OS commands (install with your system package manager)", missing)
-    print_missing("Missing managed binaries (rerun setup.py after Go is installed)", missing_managed)
+    print_missing("Missing Go-managed binaries (rerun setup.py after Go is installed)", missing_go_managed)
+    print_missing("Missing installer-managed binaries (rerun setup.py after curl is installed)", missing_installer_managed)
     print_missing("Missing tool repositories (rerun setup.py)", missing_repositories)
     print_missing("Missing wordlist repositories (rerun setup.py)", missing_wordlists)
     print("Results and runtime state: preserved")
@@ -532,6 +561,7 @@ def main() -> int:
     install_python(args.dry_run, args.force)
     install_perl_tools(args.dry_run, args.force)
     install_go(args.dry_run, args.force)
+    install_trufflehog(args.dry_run, args.force)
     if not args.dry_run:
         write_env()
     print("\nInstallation complete. Existing results were not modified.")

@@ -64,6 +64,12 @@ STAMP_NAME = ".recon-pipeline-install.json"
 SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra"}
 TRUFFLEHOG_INSTALL_URL = "https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh"
 SOURCE_GO_BINARIES = {"gitleaks", "mantra", "subover"}
+LEGACY_GO_MODULES = {
+    "SubOver": (
+        "local/subover",
+        ("github.com/parnurzeal/gorequest v0.3.0",),
+    ),
+}
 WORDLIST_REPOSITORIES = {
     "SecLists": "https://github.com/danielmiessler/SecLists.git",
     "PayloadsAllTheThings": "https://github.com/swisskyrepo/PayloadsAllTheThings.git",
@@ -409,6 +415,35 @@ def local_binary(name: str) -> Path | None:
     return None
 
 
+def ensure_legacy_go_module(source: Path, module: str, requirements: tuple[str, ...], dry_run: bool) -> None:
+    go_mod = source / "go.mod"
+    if go_mod.is_file():
+        return
+    lines = [f"module {module}", "", "go 1.20"]
+    if requirements:
+        lines.extend(["", "require (", *(f"\t{requirement}" for requirement in requirements), ")"])
+    content = "\n".join(lines) + "\n"
+    if dry_run:
+        print(f"+ create {go_mod} for legacy Go build")
+    else:
+        go_mod.write_text(content)
+
+
+def install_source_go_binary(name: str, source_name: str, dry_run: bool) -> None:
+    source = TOOLS / source_name
+    if not source.exists() and not dry_run:
+        print(f"! {name}: source checkout missing; skipping")
+        return
+    if source_name in LEGACY_GO_MODULES:
+        module, requirements = LEGACY_GO_MODULES[source_name]
+        ensure_legacy_go_module(source, module, requirements, dry_run)
+    BIN.mkdir(parents=True, exist_ok=True)
+    try:
+        run(["go", "build", "-mod=mod", "-o", str(BIN / name), "."], cwd=source, dry_run=dry_run)
+    except subprocess.CalledProcessError as exc:
+        print(f"! {name}: build failed with exit code {exc.returncode}; skipping")
+
+
 def install_go(dry_run: bool, force: bool) -> None:
     go_available = shutil.which("go") is not None
     env = os.environ.copy()
@@ -429,9 +464,7 @@ def install_go(dry_run: bool, force: bool) -> None:
         if not go_available:
             print(f"! Go is unavailable; skipping {name}")
             continue
-        if (TOOLS / source).exists() or dry_run:
-            BIN.mkdir(parents=True, exist_ok=True)
-            run(["go", "build", "-o", str(BIN / name), "."], cwd=TOOLS / source, dry_run=dry_run)
+        install_source_go_binary(name, source, dry_run)
 
 
 def install_trufflehog(dry_run: bool, force: bool) -> None:

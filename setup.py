@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import venv
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +23,9 @@ TOOLS = ROOT / "tools"
 BIN = TOOLS / "bin"
 VENV = ROOT / "venv"
 WORDLISTS = TOOLS / "wordlists"
+WAPITI_ENV = TOOLS / "wapiti" / ".venv"
+NIKTO_PERL = TOOLS / "nikto" / "perl5"
+LOCAL_BIN_DIRS = (ROOT / "bin", BIN)
 
 # Revisions tested with Recon Pipeline 2.0. Updating is an explicit operation.
 REPOSITORIES = {
@@ -30,6 +34,7 @@ REPOSITORIES = {
     "dnsenum": ("https://github.com/fwaeytens/dnsenum.git", "e3336c51a6d43d1ebb292970958e9cdc0cf93419"),
     "gitleaks": ("https://github.com/gitleaks/gitleaks.git", "8ad8470035d31a209322c580153b45c18e21b980"),
     "mantra": ("https://github.com/Brosck/mantra.git", "6026816210df756f8cc8e9d637b9f49fb277a5f0"),
+    "nikto": ("https://github.com/sullo/nikto.git", "999670cb6a939b6c93840ce666941756e4c5dcf5"),
     "recon-ng": ("https://github.com/lanmaster53/recon-ng.git", "c08acee0f84645ecf521ec616ac2dde94cbc1d63"),
     "recon-ng-marketplace": ("https://github.com/lanmaster53/recon-ng-marketplace.git", "9527714d2bb38886422bab5f1c4724d4a20d3057"),
     "spiderfoot": ("https://github.com/smicallef/spiderfoot.git", "0f815a203afebf05c98b605dba5cf0475a0ee5fd"),
@@ -55,19 +60,43 @@ GO_TOOLS = {
     "dalfox": "github.com/hahwul/dalfox/v2@latest",
 }
 
-OS_COMMANDS = ("git", "go", "nmap", "whatweb", "whois", "dig", "sslscan", "nikto", "perl")
+OS_COMMANDS = ("git", "go", "nmap", "whatweb", "whois", "dig", "sslscan", "perl")
 STAMP_NAME = ".recon-pipeline-install.json"
 SOURCE_BINARIES = {"SubOver": "subover", "gitleaks": "gitleaks", "mantra": "mantra", "trufflehog": "trufflehog"}
 WORDLIST_REPOSITORIES = {
     "SecLists": "https://github.com/danielmiessler/SecLists.git",
     "PayloadsAllTheThings": "https://github.com/swisskyrepo/PayloadsAllTheThings.git",
 }
+PYTHON_INTEGRATIONS = (
+    ("recon-ng", "REQUIREMENTS"),
+    ("XSStrike", "requirements.txt"),
+    ("spiderfoot", "requirements.txt"),
+)
+PYPI_TOOL_INTEGRATIONS = (
+    ("wapiti", WAPITI_ENV, "wapiti3", "wapiti3"),
+)
+PERL_TOOL_INTEGRATIONS = (
+    ("nikto", TOOLS / "nikto", NIKTO_PERL, ("XML::Writer",)),
+)
+
+
+@dataclass(frozen=True)
+class RequirementSpec:
+    name: str
+    specifier: str = ""
 
 
 def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None, dry_run: bool = False) -> None:
     print("+", " ".join(command))
     if not dry_run:
         subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def pip_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    env.setdefault("PIP_CACHE_DIR", str(ROOT / ".pip-cache"))
+    return env
 
 
 def clone_tools(dry_run: bool) -> None:
@@ -87,11 +116,13 @@ def clone_tools(dry_run: bool) -> None:
 
 def install_wordlists(dry_run: bool) -> None:
     """Install curated wordlist collections shallowly; never update user copies implicitly."""
-    WORDLISTS.mkdir(parents=True,exist_ok=True)
-    for name,url in WORDLIST_REPOSITORIES.items():
-        destination=WORDLISTS/name
-        if destination.exists():print(f"= {name} wordlists: already present");continue
-        run(["git","clone","--depth","1","--filter=blob:none",url,str(destination)],dry_run=dry_run)
+    WORDLISTS.mkdir(parents=True, exist_ok=True)
+    for name, url in WORDLIST_REPOSITORIES.items():
+        destination = WORDLISTS / name
+        if destination.exists():
+            print(f"= {name} wordlists: already present")
+            continue
+        run(["git", "clone", "--depth", "1", "--filter=blob:none", url, str(destination)], dry_run=dry_run)
 
 
 def python_executable(environment: Path) -> Path:
@@ -117,6 +148,26 @@ def normalize_package(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def requirement_parser():
+    for module in ("packaging.requirements", "pip._vendor.packaging.requirements"):
+        try:
+            imported = __import__(module, fromlist=["Requirement"])
+            return imported.Requirement
+        except (ImportError, AttributeError):
+            continue
+    return None
+
+
+def specifier_parser():
+    for module in ("packaging.specifiers", "pip._vendor.packaging.specifiers"):
+        try:
+            imported = __import__(module, fromlist=["SpecifierSet"])
+            return imported.SpecifierSet
+        except (ImportError, AttributeError):
+            continue
+    return None
+
+
 def installed_packages(python: Path) -> dict[str, str]:
     if not python.is_file():
         return {}
@@ -128,18 +179,113 @@ def installed_packages(python: Path) -> dict[str, str]:
         return {}
 
 
-def required_packages(path: Path) -> dict[str, str | None]:
-    required: dict[str, str | None] = {}
+def required_packages(path: Path) -> dict[str, RequirementSpec]:
+    required: dict[str, RequirementSpec] = {}
     if not path.is_file():
         return required
+    parser = requirement_parser()
     for raw in path.read_text(errors="replace").splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", "-", "git+", "http:" , "https:")):
             continue
-        match = re.match(r"([A-Za-z0-9_.-]+)\s*(?:==\s*([^\s;]+))?", line)
+        if parser:
+            try:
+                requirement = parser(line)
+            except Exception:
+                continue
+            if requirement.marker and not requirement.marker.evaluate():
+                continue
+            name = normalize_package(requirement.name)
+            required[name] = RequirementSpec(name=name, specifier=str(requirement.specifier))
+            continue
+        match = re.match(r"([A-Za-z0-9_.-]+)\s*([<>=!~].*)?$", line)
         if match:
-            required[normalize_package(match.group(1))] = match.group(2)
+            name = normalize_package(match.group(1))
+            required[name] = RequirementSpec(name=name, specifier=(match.group(2) or "").strip())
     return required
+
+
+def requirement_satisfied(installed: dict[str, str], requirement: RequirementSpec) -> bool:
+    version = installed.get(requirement.name)
+    if not version:
+        return False
+    if not requirement.specifier:
+        return True
+    parser = specifier_parser()
+    if parser:
+        try:
+            return parser(requirement.specifier).contains(version, prereleases=True)
+        except Exception:
+            return False
+    exact = re.fullmatch(r"==\s*([^,;\s]+)", requirement.specifier)
+    return bool(exact and version == exact.group(1))
+
+
+def missing_requirements(python: Path, requirements: Path | None = None, distribution: str | None = None) -> list[str]:
+    installed = installed_packages(python)
+    required = required_packages(requirements) if requirements else {}
+    if distribution:
+        name = normalize_package(distribution)
+        required[name] = RequirementSpec(name=name)
+    missing: list[str] = []
+    for name, requirement in sorted(required.items()):
+        if requirement_satisfied(installed, requirement):
+            continue
+        current = installed.get(name)
+        want = requirement.specifier or "required"
+        missing.append(f"{name} ({current or 'missing'} -> {want})")
+    return missing
+
+
+def perl_environment(perl_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    lib = perl_root / "lib" / "perl5"
+    home = perl_root / "home"
+    cpan_home = perl_root / "cpan"
+    env["HOME"] = str(home)
+    env["PERL5LIB"] = str(lib) + (os.pathsep + env["PERL5LIB"] if env.get("PERL5LIB") else "")
+    env["PERL_MM_OPT"] = f"INSTALL_BASE={perl_root}"
+    env["PERL_MB_OPT"] = f"--install_base {perl_root}"
+    env["PERL_CPAN_HOME"] = str(cpan_home)
+    env["PERL_MM_USE_DEFAULT"] = "1"
+    env["NONINTERACTIVE_TESTING"] = "1"
+    env.setdefault("PERL_CPANM_OPT", "--notest")
+    return env
+
+
+def missing_perl_modules(perl_root: Path, modules: tuple[str, ...]) -> list[str]:
+    env = perl_environment(perl_root)
+    missing = []
+    for module in modules:
+        result = subprocess.run(["perl", "-M" + module, "-e", "1"], env=env, text=True, capture_output=True)
+        if result.returncode != 0:
+            missing.append(module)
+    return missing
+
+
+def install_perl_tools(dry_run: bool, force: bool) -> None:
+    if not shutil.which("cpan"):
+        print("! cpan is unavailable; skipping Perl tool dependencies")
+        return
+    for name, source, perl_root, modules in PERL_TOOL_INTEGRATIONS:
+        if not source.exists() and not dry_run:
+            continue
+        missing = list(modules) if force else missing_perl_modules(perl_root, modules)
+        if not missing:
+            print(f"= {name} Perl dependencies: already satisfied")
+            continue
+        perl_root.mkdir(parents=True, exist_ok=True)
+        (perl_root / "home").mkdir(parents=True, exist_ok=True)
+        (perl_root / "cpan").mkdir(parents=True, exist_ok=True)
+        env = perl_environment(perl_root)
+        for module in missing:
+            run(["cpan", "-T", "-i", module], cwd=source if source.exists() else ROOT, env=env, dry_run=dry_run)
+
+
+def integration_skip_reason(name: str) -> str | None:
+    if name == "spiderfoot" and sys.version_info >= (3, 14):
+        return "SpiderFoot pins lxml<5, which does not build on Python 3.14+; skipping this optional integration"
+    return None
 
 
 def environment_ready(environment: Path, wanted: str, requirements: Path | None = None, distribution: str | None = None, *, record: bool = True) -> bool:
@@ -152,11 +298,7 @@ def environment_ready(environment: Path, wanted: str, requirements: Path | None 
             return True
     except (OSError, json.JSONDecodeError):
         pass
-    installed = installed_packages(python)
-    required = required_packages(requirements) if requirements else {}
-    if distribution:
-        required[normalize_package(distribution)] = None
-    if not required or any(name not in installed or (version and installed[name] != version) for name, version in required.items()):
+    if missing_requirements(python, requirements, distribution):
         return False
     if record:
         stamp.write_text(json.dumps({"fingerprint": wanted}, indent=2) + "\n")
@@ -168,35 +310,62 @@ def mark_environment(environment: Path, wanted: str, dry_run: bool) -> None:
         (environment / STAMP_NAME).write_text(json.dumps({"fingerprint": wanted}, indent=2) + "\n")
 
 
+def ensure_virtualenv(environment: Path, dry_run: bool) -> bool:
+    python = python_executable(environment)
+    if python.is_file():
+        return False
+    if dry_run:
+        print(f"+ create virtual environment {environment}")
+    else:
+        print(f"+ create virtual environment {environment}")
+        venv.EnvBuilder(with_pip=True).create(environment)
+    return True
+
+
+def ensure_pip(environment: Path, dry_run: bool) -> None:
+    python = python_executable(environment)
+    if dry_run:
+        if not python.is_file():
+            print(f"+ {python} -m ensurepip --upgrade")
+        return
+    try:
+        subprocess.run([str(python), "-m", "pip", "--version"], text=True, capture_output=True, check=True)
+        return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    run([str(python), "-m", "ensurepip", "--upgrade"])
+    subprocess.run([str(python), "-m", "pip", "--version"], text=True, capture_output=True, check=True)
+
+
 def install_python(dry_run: bool, force: bool) -> None:
-    created = not python_executable(VENV).is_file()
-    if created and not dry_run:
-        print(f"+ create virtual environment {VENV}")
-        venv.EnvBuilder(with_pip=True).create(VENV)
+    created = ensure_virtualenv(VENV, dry_run)
+    ensure_pip(VENV, dry_run)
     python = python_executable(VENV)
     main_requirements = ROOT / "requirements.txt"
+    pip_env = pip_environment()
     wanted = fingerprint(main_requirements)
     if not force and not created and environment_ready(VENV, wanted, main_requirements, record=not dry_run):
         print("= application Python dependencies: already satisfied")
     else:
         if created or force:
-            run([str(python), "-m", "pip", "install", "--upgrade", "pip", "wheel"], dry_run=dry_run)
-        run([str(python), "-m", "pip", "install", "-r", str(main_requirements)], dry_run=dry_run)
+            run([str(python), "-m", "pip", "install", "--upgrade", "pip", "wheel"], env=pip_env, dry_run=dry_run)
+        run([str(python), "-m", "pip", "install", "-r", str(main_requirements)], env=pip_env, dry_run=dry_run)
         mark_environment(VENV, wanted, dry_run)
-    integrations = (("recon-ng", "REQUIREMENTS"), ("XSStrike", "requirements.txt"), ("spiderfoot", "requirements.txt"))
-    for name, requirements in integrations:
+    for name, requirements in PYTHON_INTEGRATIONS:
         source, environment = TOOLS / name, TOOLS / name / ".venv"
         requirement_file = source / requirements
         if not source.exists() and not dry_run:
+            continue
+        if reason := integration_skip_reason(name):
+            print(f"! {reason}")
             continue
         wanted = fingerprint(requirement_file, salt=source_revision(source))
         if not force and environment_ready(environment, wanted, requirement_file, record=not dry_run):
             print(f"= {name} Python dependencies: already satisfied")
             continue
-        if not environment.exists() and not dry_run:
-            print(f"+ create isolated environment {environment}")
-            venv.EnvBuilder(with_pip=True).create(environment)
-        run([str(python_executable(environment)), "-m", "pip", "install", "-r", str(requirement_file)], cwd=source, dry_run=dry_run)
+        ensure_virtualenv(environment, dry_run)
+        ensure_pip(environment, dry_run)
+        run([str(python_executable(environment)), "-m", "pip", "install", "-r", str(requirement_file)], cwd=source, env=pip_env, dry_run=dry_run)
         mark_environment(environment, wanted, dry_run)
     for name, install_target in (("theHarvester", "."),):
         source, environment = TOOLS / name, TOOLS / name / ".venv"
@@ -209,16 +378,31 @@ def install_python(dry_run: bool, force: bool) -> None:
         if not force and environment_ready(environment, wanted, distribution="theHarvester", record=not dry_run):
             print("= theHarvester Python dependencies: already satisfied")
             continue
-        if not environment.exists() and not dry_run:
-            print(f"+ create isolated environment {environment}")
-            venv.EnvBuilder(with_pip=True).create(environment)
-        run([str(python_executable(environment)), "-m", "pip", "install", install_target], cwd=source, dry_run=dry_run)
+        ensure_virtualenv(environment, dry_run)
+        ensure_pip(environment, dry_run)
+        run([str(python_executable(environment)), "-m", "pip", "install", install_target], cwd=source, env=pip_env, dry_run=dry_run)
+        mark_environment(environment, wanted, dry_run)
+    for name, environment, package, distribution in PYPI_TOOL_INTEGRATIONS:
+        wanted = fingerprint(ROOT / "setup.py", salt=f"{name}:{package}")
+        if not force and environment_ready(environment, wanted, distribution=distribution, record=not dry_run):
+            print(f"= {name} Python tool: already satisfied")
+            continue
+        ensure_virtualenv(environment, dry_run)
+        ensure_pip(environment, dry_run)
+        run([str(python_executable(environment)), "-m", "pip", "install", package], env=pip_env, dry_run=dry_run)
         mark_environment(environment, wanted, dry_run)
 
 
 def binary_available(name: str) -> bool:
-    local = BIN / name
-    return (local.is_file() and os.access(local, os.X_OK)) or shutil.which(name) is not None
+    return local_binary(name) is not None or shutil.which(name) is not None
+
+
+def local_binary(name: str) -> Path | None:
+    for folder in LOCAL_BIN_DIRS:
+        local = folder / name
+        if local.is_file() and os.access(local, os.X_OK):
+            return local
+    return None
 
 
 def install_go(dry_run: bool, force: bool) -> None:
@@ -249,15 +433,78 @@ def write_env() -> None:
         print("+ created .env from .env.example; change its secrets before starting the web app")
 
 
+def validate_project_files(parser: argparse.ArgumentParser) -> None:
+    required = [ROOT / "requirements.txt", ROOT / ".env.example"]
+    missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
+    if missing:
+        parser.error("missing required project file(s): " + ", ".join(missing))
+
+
+def executable_in_search_path(name: str, search: list[str]) -> bool:
+    for folder in search:
+        executable = Path(folder) / name
+        if executable.is_file() and os.access(executable, os.X_OK):
+            return True
+    return False
+
+
+def print_missing(label: str, missing: list[str]) -> None:
+    if missing:
+        print(f"{label}: " + ", ".join(missing))
+
+
 def status() -> int:
-    search = os.environ.get("PATH", "").split(os.pathsep) + [str(BIN)]
-    missing = [name for name in OS_COMMANDS if not any((Path(folder) / name).exists() for folder in search)]
+    search = [str(path) for path in LOCAL_BIN_DIRS] + os.environ.get("PATH", "").split(os.pathsep)
+    missing = [name for name in OS_COMMANDS if not executable_in_search_path(name, search)]
+    managed = set(GO_TOOLS) | {"gitleaks", "trufflehog", "mantra", "subover"}
+    missing_managed = sorted(name for name in managed if not binary_available(name))
+    missing_repositories = sorted(name for name in REPOSITORIES if not (TOOLS / name).exists())
+    missing_wordlists = sorted(name for name in WORDLIST_REPOSITORIES if not (WORDLISTS / name).exists())
+    app_missing = missing_requirements(python_executable(VENV), ROOT / "requirements.txt")
     print(f"Python: {sys.version.split()[0]}")
     print(f"Tool repositories: {sum((TOOLS / name).exists() for name in REPOSITORIES)}/{len(REPOSITORIES)}")
-    managed = set(GO_TOOLS) | {"gitleaks", "trufflehog", "mantra", "subover"}
     print(f"Available managed binaries: {sum(binary_available(name) for name in managed)}/{len(managed)}")
-    if missing:
-        print("Missing OS commands (install with your system package manager): " + ", ".join(missing))
+    print(f"Wordlist repositories: {sum((WORDLISTS / name).exists() for name in WORDLIST_REPOSITORIES)}/{len(WORDLIST_REPOSITORIES)}")
+    if python_executable(VENV).is_file() and not app_missing:
+        print("Application Python dependencies: satisfied")
+    elif app_missing:
+        print_missing("Application Python dependencies to repair", app_missing)
+    else:
+        print("Application Python dependencies: virtual environment missing")
+    for name, requirements in PYTHON_INTEGRATIONS:
+        source, environment = TOOLS / name, TOOLS / name / ".venv"
+        if not source.exists():
+            continue
+        if reason := integration_skip_reason(name):
+            print(f"{name} Python dependencies: skipped ({reason})")
+            continue
+        integration_missing = missing_requirements(python_executable(environment), source / requirements)
+        if integration_missing:
+            print_missing(f"{name} Python dependencies to repair", integration_missing)
+    harvester = TOOLS / "theHarvester"
+    if harvester.exists() and sys.version_info >= (3, 12):
+        harvester_missing = missing_requirements(python_executable(harvester / ".venv"), distribution="theHarvester")
+        if harvester_missing:
+            print_missing("theHarvester Python dependencies to repair", harvester_missing)
+    for name, environment, _package, distribution in PYPI_TOOL_INTEGRATIONS:
+        tool_missing = missing_requirements(python_executable(environment), distribution=distribution)
+        if python_executable(environment).is_file() and not tool_missing:
+            print(f"{name} Python tool: satisfied")
+        elif tool_missing:
+            print_missing(f"{name} Python tool to repair", tool_missing)
+        else:
+            print(f"{name} Python tool: virtual environment missing")
+    for name, source, perl_root, modules in PERL_TOOL_INTEGRATIONS:
+        if source.exists():
+            perl_missing = missing_perl_modules(perl_root, modules)
+            if perl_missing:
+                print_missing(f"{name} Perl dependencies to repair", perl_missing)
+            else:
+                print(f"{name} Perl dependencies: satisfied")
+    print_missing("Missing OS commands (install with your system package manager)", missing)
+    print_missing("Missing managed binaries (rerun setup.py after Go is installed)", missing_managed)
+    print_missing("Missing tool repositories (rerun setup.py)", missing_repositories)
+    print_missing("Missing wordlist repositories (rerun setup.py)", missing_wordlists)
     print("Results and runtime state: preserved")
     return 0
 
@@ -274,9 +521,11 @@ def main() -> int:
         parser.error("Python 3.11 or newer is required")
     if not shutil.which("git"):
         parser.error("git is required")
+    validate_project_files(parser)
     clone_tools(args.dry_run)
     install_wordlists(args.dry_run)
     install_python(args.dry_run, args.force)
+    install_perl_tools(args.dry_run, args.force)
     install_go(args.dry_run, args.force)
     if not args.dry_run:
         write_env()

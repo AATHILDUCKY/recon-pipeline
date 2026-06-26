@@ -127,10 +127,34 @@ class PipelineTests(unittest.TestCase):
             for args,kwargs in calls:
                 self.assertEqual(args[args.index("-rate")+1],"17")
                 self.assertEqual(args[args.index("-recursion-depth")+1],"2")
+                self.assertEqual(args[args.index("-recursion-strategy")+1],"default")
                 self.assertTrue(args[args.index("-w")+1].endswith("wordlists/web-discovery-common.txt"))
                 self.assertTrue(kwargs["artifact_name"].startswith("ffuf-"))
             urls=pipeline.db.values("SELECT url FROM endpoints WHERE run_id=? ORDER BY url",(pipeline.run_id,))
             self.assertEqual(urls,["https://api.example.com/admin","https://example.com/admin"])
+
+    def test_httpx_marks_active_hosts_and_recursively_resolves_extracted_subdomains(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg);calls=[]
+            pipeline.db.execute("INSERT INTO assets(run_id,hostname,source,resolved,first_seen) VALUES(?,?,?,?,?)",(pipeline.run_id,"a.example.com","test",1,rp.utcnow()));pipeline.db.conn.commit()
+            async def fake_run_tool(stage, name, args, **kwargs):
+                artifact=kwargs.get("artifact_name",name);calls.append((name,artifact,args,kwargs));output=pipeline.raw/f"{artifact}.stdout"
+                if name=="httpx":
+                    target="a.example.com" if artifact.endswith("01") else "b.example.com"
+                    row={"url":f"https://{target}/","status_code":200,"title":target,"host_ip":"192.0.2.10","body_fqdn":["b.example.com"] if target.startswith("a.") else []}
+                    output.write_text(json.dumps(row)+"\n")
+                elif name=="dnsx":output.write_text(json.dumps({"host":"b.example.com","a":["192.0.2.11"],"aaaa":[],"cname":[]})+"\n")
+                else:output.write_text("")
+                return 0,output
+            pipeline.run_tool=fake_run_tool;pipeline.tool=lambda *names:"/fake/"+names[0]
+            asyncio.run(pipeline.probe())
+            http_calls=[call for call in calls if call[0]=="httpx"]
+            self.assertEqual([call[1] for call in http_calls],["httpx-round-01","httpx-round-02"])
+            self.assertIn("-nf",http_calls[0][2]);self.assertIn("-efqdn",http_calls[0][2])
+            rows=[tuple(row) for row in pipeline.db.conn.execute("SELECT hostname,resolved,http_active,http_status FROM assets ORDER BY hostname")]
+            self.assertEqual(rows,[("a.example.com",1,1,200),("b.example.com",1,1,200)])
+            self.assertEqual(pipeline.db.conn.execute("SELECT COUNT(*) FROM http_services").fetchone()[0],2)
 
     def test_wayback_discovery_feeds_archived_hosts_and_prioritized_urls_into_deep_scan(self):
         cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,10,None,False,set(),100,100_000,10,0.5,3)
@@ -202,12 +226,36 @@ class PipelineTests(unittest.TestCase):
                 output.write_text(json.dumps([{"target":"https://app.example.com/","plugins":{"WordPress":{"version":["6.4"]},"PHP":{"version":["8.2"]},"Title":{"string":["Ignored"]}}}]))
                 return 0,pipeline.raw/"whatweb.stdout"
             pipeline.run_tool=fake_run_tool
+            pipeline.fetch_text=lambda url: None
             asyncio.run(pipeline.technologies())
             args=calls[0]
             self.assertIn("--aggression=3",args);self.assertIn("--max-threads=1",args)
             self.assertTrue(any(arg.startswith("--wait=") for arg in args))
             stored=json.loads(pipeline.db.conn.execute("SELECT technologies FROM http_services").fetchone()[0])
             self.assertEqual(stored,["PHP:8.2","React","WordPress:6.4"])
+            tech_rows=[tuple(row) for row in pipeline.db.conn.execute("SELECT name,version,source FROM technologies ORDER BY name,version")]
+            self.assertIn(("WordPress","6.4","whatweb"),tech_rows)
+            self.assertIn(("PHP","8.2","whatweb"),tech_rows)
+
+    def test_page_source_technology_probe_extracts_cms_and_framework_versions(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg);calls=[]
+            pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status,server,technologies) VALUES(?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/","app.example.com",200,"nginx/1.24.0","[]"))
+            html='''<html><head><meta name="generator" content="WordPress 6.5.4"><script id="__NEXT_DATA__" type="application/json">{}</script><script src="/_next/static/chunks/main.js"></script><script src="/static/react.production.min.js?ver=18.2.0"></script></head></html>'''
+            async def fake_run_tool(stage, name, args, **kwargs):
+                calls.append((name,args));Path(next(arg.split("=",1)[1] for arg in args if arg.startswith("--log-json="))).write_text("[]")
+                return 0,pipeline.raw/"whatweb.stdout"
+            pipeline.run_tool=fake_run_tool
+            pipeline.fetch_text=lambda url: (url,html)
+            asyncio.run(pipeline.technologies())
+            rows=[tuple(row) for row in pipeline.db.conn.execute("SELECT name,version,source FROM technologies ORDER BY name,version,source")]
+            self.assertIn(("nginx","1.24.0","server-header"),rows)
+            self.assertIn(("WordPress","6.5.4","page-source"),rows)
+            self.assertIn(("Next.js","","page-source"),rows)
+            self.assertIn(("React","18.2.0","page-source"),rows)
+            stored=json.loads(pipeline.db.conn.execute("SELECT technologies FROM http_services").fetchone()[0])
+            self.assertIn("WordPress:6.5.4",stored);self.assertIn("React:18.2.0",stored);self.assertIn("Next.js",stored)
 
     def test_subjack_json_only_creates_findings_for_positive_in_scope_results(self):
         cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
@@ -241,6 +289,57 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(rows,[("nuclei","generic-check"),("nuclei-tech","CVE-2025-1234")])
             self.assertIsNotNone(pipeline.db.conn.execute("SELECT 1 FROM domain_info WHERE key='Vulnerability templates'").fetchone())
 
+    def test_wapiti_uses_prioritized_inventory_and_ingests_json_report(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg);calls=[]
+            pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status,server,technologies) VALUES(?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/","app.example.com",200,"nginx",'["WordPress:6.5","Java"]'))
+            pipeline.db.execute("INSERT INTO endpoints(run_id,url,host,path,query_keys,extension,source,first_seen) VALUES(?,?,?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/search?q=test","app.example.com","/search",'["q"]',"","test",rp.utcnow()))
+            pipeline.db.execute("INSERT INTO input_points(run_id,page_url,action_url,method,name,input_type) VALUES(?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/upload","https://app.example.com/upload","POST","avatar","file"))
+            async def fake_run_tool(stage, name, args, **kwargs):
+                calls.append((stage,name,args,kwargs));report=Path(args[args.index("-o")+1])
+                report.write_text(json.dumps({"classifications":{"SQL Injection":{"desc":"SQLi","sol":"fix","ref":{"OWASP":"https://owasp.org"}}},"vulnerabilities":{"SQL Injection":[{"method":"GET","path":"/search?q=test","info":"SQL injection via parameter q","level":3,"parameter":"q","module":"sql","curl_command":"curl https://app.example.com/search?q=test"}]},"anomalies":{},"additionals":{},"infos":{"target":"https://app.example.com/"}}))
+                return 0,pipeline.raw/"wapiti.stdout"
+            pipeline.run_tool=fake_run_tool;pipeline.wapiti_executable=lambda:"/fake/wapiti"
+            asyncio.run(pipeline.wapiti_checks())
+            args=calls[0][2]
+            self.assertIn("--max-scan-time",args);self.assertIn("--max-attack-time",args);self.assertIn("--scope",args)
+            modules=set(args[args.index("-m")+1].split(","))
+            self.assertTrue({"wapp","cms","xss","sql","timesql","upload","log4shell","spring4shell"} <= modules)
+            self.assertIn("https://app.example.com/search?q=test",[args[i+1] for i,value in enumerate(args[:-1]) if value=="-s"])
+            row=pipeline.db.conn.execute("SELECT tool,severity,template_id,name,matched_at,host FROM findings WHERE run_id=?",(pipeline.run_id,)).fetchone()
+            self.assertEqual(tuple(row),("wapiti","high","wapiti:sql:SQL Injection","SQL Injection: SQL injection via parameter q","https://app.example.com/search?q=test","app.example.com"))
+
+    def test_wapiti_target_selection_prefers_parameterized_origins(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg)
+            for url,host in (("https://static.example.com/","static.example.com"),("https://app.example.com/","app.example.com")):
+                pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status,technologies) VALUES(?,?,?,?,?)",(pipeline.run_id,url,host,200,"[]"))
+            pipeline.db.execute("INSERT INTO endpoints(run_id,url,host,path,query_keys,extension,source,first_seen) VALUES(?,?,?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/item?id=1","app.example.com","/item",'["id"]',"","test",rp.utcnow()))
+            targets=pipeline.wapiti_origin_targets()
+            self.assertEqual(targets[0]["base"],"https://app.example.com/")
+            self.assertIn("https://app.example.com/item?id=1",targets[0]["starts"])
+
+    def test_nikto_uses_managed_tool_prioritized_targets_and_ingests_xml(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg);calls=[]
+            pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status,server,technologies) VALUES(?,?,?,?,?,?)",(pipeline.run_id,"https://static.example.com/","static.example.com",200,"nginx","[]"))
+            pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status,server,technologies) VALUES(?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/","app.example.com",200,"Apache",'["WordPress:6.5","PHP:8.2"]'))
+            pipeline.db.execute("INSERT INTO endpoints(run_id,url,host,path,query_keys,extension,source,first_seen) VALUES(?,?,?,?,?,?,?,?)",(pipeline.run_id,"https://app.example.com/admin.php?id=1","app.example.com","/admin.php",'["id"]',"php","test",rp.utcnow()))
+            xml='''<?xml version="1.0"?><niktoscan><scandetails><item id="999001"><description>Admin page may disclose sensitive configuration backup file</description><uri>/admin.php</uri><namelink>https://app.example.com/admin.php</namelink></item></scandetails></niktoscan>'''
+            async def fake_run_tool(stage,name,args,**kwargs):
+                calls.append((stage,name,args,kwargs));Path(args[args.index("-output")+1]).write_text(xml)
+                return 0,pipeline.raw/"nikto.stdout"
+            pipeline.run_tool=fake_run_tool;pipeline.nikto_executable=lambda:"/fake/nikto";pipeline.nikto_cwd=lambda:Path(folder)
+            asyncio.run(pipeline.nikto_checks())
+            args=calls[0][2]
+            self.assertEqual(args[args.index("-host")+1],"https://app.example.com/")
+            self.assertIn("-Tuning",args);self.assertIn("-maxtime",args);self.assertIn("-Pause",args)
+            row=pipeline.db.conn.execute("SELECT tool,severity,template_id,name,matched_at,host FROM findings WHERE run_id=?",(pipeline.run_id,)).fetchone()
+            self.assertEqual(tuple(row),("nikto","medium","nikto:999001","Admin page may disclose sensitive configuration backup file","https://app.example.com/admin.php","app.example.com"))
+
     def test_deep_nmap_scans_all_tcp_ports_and_ingests_detailed_services(self):
         cfg = rp.Config("example.com","deep",Path("."),25,10,10,2,100,None,False,set(),100,100_000,10,0.5,3)
         with TemporaryDirectory() as folder:
@@ -264,6 +363,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(tuple(row[:8]),("api.example.com","192.0.2.10",443,"open","syn-ack","nginx","1.24.0","Ubuntu"))
             self.assertIn("nginx:1.24.0",row[8]);self.assertIn("ssl-cert",row[9]);self.assertEqual(row[10],"nmap")
             self.assertEqual(pipeline.db.conn.execute("SELECT port FROM ports WHERE ip='2001:db8::10'").fetchone()[0],8443)
+            tech=[tuple(row) for row in pipeline.db.conn.execute("SELECT host,name,version,source FROM technologies ORDER BY name")]
+            self.assertIn(("api.example.com","nginx","1.24.0","nmap-service"),tech)
+            self.assertIn(("api.example.com","Ubuntu","","nmap-service"),tech)
 
 
 if __name__ == "__main__": unittest.main()

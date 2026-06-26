@@ -19,6 +19,7 @@ import ipaddress
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -38,9 +39,24 @@ FFUF_VALID_STATUSES = frozenset((*range(200, 300), 301, 302, 307, 308, 401, 403,
 WHATWEB_METADATA_PLUGINS = {"country","email","html5","httpserver","ip","passwordfield","script","title","uncommonheaders"}
 DOMAIN_RE = re.compile(r"(?=^.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.I)
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+VERSION_RE = re.compile(r"(?<![A-Za-z0-9])v?(\d+(?:[._-]\d+){0,5}(?:[a-z0-9._+-]*))", re.I)
 SECRET_QUERY_KEYS = {"access_token", "api_key", "apikey", "auth", "authorization", "client_secret", "key", "password", "secret", "sig", "signature", "token"}
 SKIP_FETCH_EXTENSIONS = {"7z","avi","avif","bmp","css","eot","flac","gif","gz","ico","jpeg","jpg","m4a","mov","mp3","mp4","mpeg","otf","pdf","png","rar","svg","tar","ttf","wav","webm","webp","woff","woff2","zip"}
 ANSI = {"cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m", "dim": "\033[2m", "reset": "\033[0m"}
+WAPITI_BASE_MODULES = {"wapp", "cms", "methods"}
+WAPITI_PARAMETER_MODULES = {"xss", "permanentxss", "sql", "timesql", "file", "exec", "redirect", "crlf", "ldap"}
+WAPITI_BODY_MODULES = {"xxe"}
+WAPITI_UPLOAD_MODULES = {"upload"}
+WAPITI_TECH_MODULES = {"log4shell", "spring4shell"}
+WAPITI_LEVELS = {4: "critical", 3: "high", 2: "medium", 1: "low", 0: "info"}
+TECH_CATEGORY_RULES = (
+    ("CMS & commerce", ("wordpress", "drupal", "joomla", "shopify", "magento", "woocommerce", "ghost", "contentful", "strapi", "sanity", "directus")),
+    ("Frameworks", ("react", "next.js", "nextjs", "vue", "nuxt", "angular", "svelte", "django", "flask", "laravel", "rails", "spring", "asp.net", "express")),
+    ("Languages & runtimes", ("php", "python", "ruby", "java", "node.js", "nodejs", "perl", "go", "openjdk")),
+    ("Servers & proxies", ("nginx", "apache", "httpd", "iis", "caddy", "tomcat", "envoy", "haproxy", "openresty", "gunicorn")),
+    ("Operating systems", ("ubuntu", "debian", "centos", "red hat", "rhel", "almalinux", "rocky linux", "windows server")),
+    ("CDN, analytics & security", ("cdn:", "waf:", "cloudflare", "akamai", "fastly", "imperva", "sucuri")),
+)
 
 
 def utcnow() -> str:
@@ -101,6 +117,113 @@ def json_lines(path: Path) -> Iterable[dict[str, Any]]:
                 continue
 
 
+def clean_version(value: str) -> str:
+    value = str(value or "").strip().strip(",:;()[]{}<>\"'")
+    if not value:
+        return ""
+    match = VERSION_RE.search(value)
+    return match.group(1).replace("_", ".") if match else ""
+
+
+def technology_category(name: str) -> str:
+    low = str(name or "").lower()
+    for category, needles in TECH_CATEGORY_RULES:
+        if any(needle in low for needle in needles):
+            return category
+    return "Other detected technologies"
+
+
+def technology_label(name: str, version: str = "") -> str:
+    name = " ".join(str(name or "").strip().split())
+    version = clean_version(version)
+    return f"{name}:{version}" if name and version else name
+
+
+def split_technology_label(label: str) -> tuple[str, str]:
+    label = str(label or "").strip()
+    if not label:
+        return "", ""
+    cpe = parse_cpe_technology(label)
+    if cpe:
+        return cpe
+    if ":" in label:
+        name, version = label.split(":", 1)
+        cleaned = clean_version(version)
+        if cleaned:
+            return name.strip(), cleaned
+    match = re.match(r"(.+?)[/\s]+v?(\d+(?:[._-]\d+)*(?:[a-z0-9._+-]*))$", label, re.I)
+    if match:
+        return match.group(1).strip(), clean_version(match.group(2))
+    return label, ""
+
+
+def parse_cpe_technology(cpe: str) -> tuple[str, str] | None:
+    value = str(cpe or "").strip()
+    if not value.startswith("cpe:"):
+        return None
+    parts = value.split(":")
+    if value.startswith("cpe:/") and len(parts) >= 5:
+        vendor, product, version = parts[2], parts[3], parts[4]
+    elif value.startswith("cpe:2.3:") and len(parts) >= 6:
+        vendor, product, version = parts[3], parts[4], parts[5]
+    else:
+        return None
+    product = product.replace("_", " ").strip() or vendor.replace("_", " ").strip()
+    version = "" if version in {"*", "-", "ANY"} else clean_version(version)
+    return product, version
+
+
+def parse_server_technology(server: str) -> list[tuple[str, str]]:
+    values = []
+    for part in re.split(r"\s*,\s*", str(server or "")):
+        for token in part.split():
+            if not token or token.lower() in {"via", "server"}:
+                continue
+            if "/" in token:
+                name, version = token.split("/", 1)
+                if re.search(r"[A-Za-z]", name):
+                    values.append((name.strip(), clean_version(version)))
+            elif token.lower() in {"nginx", "apache", "cloudflare", "openresty", "caddy"}:
+                values.append((token, ""))
+    return values
+
+
+def extract_generator_technologies(text: str) -> list[tuple[str, str, str]]:
+    found = []
+    for content in re.findall(r"<meta\b[^>]*\bname=[\"']generator[\"'][^>]*\bcontent=[\"']([^\"']+)", text, re.I):
+        raw = html.unescape(content)
+        for name in ("WordPress", "Drupal", "Joomla", "Ghost", "Magento", "Shopify", "Wix", "Webflow"):
+            if re.search(re.escape(name), raw, re.I):
+                found.append((name, clean_version(raw), f"meta generator: {raw[:160]}"))
+    return found
+
+
+def extract_body_technologies(url: str, text: str) -> list[tuple[str, str, str]]:
+    found = extract_generator_technologies(text)
+    low = text.lower()
+    if "wp-content/" in low or "wp-includes/" in low:
+        versions = re.findall(r"(?:wp-(?:includes|content)|wordpress)[^\"'<>?\s]*[?&]ver=([0-9][A-Za-z0-9._+-]*)", text, re.I)
+        found.append(("WordPress", clean_version(versions[0]) if versions else "", "WordPress asset path"))
+    if "/_next/static/" in low or '"__next_data__"' in low or "__NEXT_DATA__" in text:
+        version = next((clean_version(match) for match in re.findall(r"next(?:\.js)?[@/\s-]+v?([0-9][A-Za-z0-9._+-]*)", text, re.I) if clean_version(match)), "")
+        found.append(("Next.js", version, "Next.js runtime markers"))
+    react_version = next((clean_version(match) for match in re.findall(r"react(?:\.production\.min)?\.js(?:\?[^\"'<>\s]*ver=|[@/\s-]+v?)([0-9][A-Za-z0-9._+-]*)", text, re.I) if clean_version(match)), "")
+    if react_version or any(marker in low for marker in ("data-reactroot", "react-dom", "__react", "react-refresh")):
+        found.append(("React", react_version, "React runtime markers"))
+    if "drupal-settings-json" in low or "/sites/default/" in low:
+        found.append(("Drupal", "", "Drupal page markers"))
+    if "joomla" in low or "/media/system/js/" in low:
+        found.append(("Joomla", "", "Joomla page markers"))
+    if "woocommerce" in low:
+        found.append(("WooCommerce", "", "WooCommerce page markers"))
+    for package in ("vue", "angular", "svelte", "nuxt", "jquery", "bootstrap", "lodash"):
+        pattern = re.compile(rf"{package}(?:\.min)?\.js(?:\?[^\"'<>\s]*ver=|[@/\s-]+v?)([0-9][A-Za-z0-9._+-]*)", re.I)
+        version = next((clean_version(match) for match in pattern.findall(text) if clean_version(match)), "")
+        if version:
+            found.append((package.title() if package != "jquery" else "jQuery", version, f"{package} asset version"))
+    return found
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -110,10 +233,11 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, domain TEXT, profile TEXT, started_at TEXT, finished_at TEXT, status TEXT, config_json TEXT);
-        CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, source TEXT, resolved INTEGER DEFAULT 0, first_seen TEXT, UNIQUE(run_id,hostname), FOREIGN KEY(run_id) REFERENCES runs(id));
+        CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, source TEXT, resolved INTEGER DEFAULT 0, http_active INTEGER DEFAULT 0, active_url TEXT, http_status INTEGER, first_seen TEXT, UNIQUE(run_id,hostname), FOREIGN KEY(run_id) REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS dns_records(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, type TEXT, value TEXT, source TEXT, UNIQUE(run_id,hostname,type,value));
         CREATE TABLE IF NOT EXISTS ports(id INTEGER PRIMARY KEY, run_id INTEGER, hostname TEXT, ip TEXT, port INTEGER, protocol TEXT, service TEXT, state TEXT, reason TEXT, product TEXT, version TEXT, extra_info TEXT, cpe TEXT, scripts TEXT, source TEXT, UNIQUE(run_id,hostname,ip,port,protocol));
         CREATE TABLE IF NOT EXISTS http_services(id INTEGER PRIMARY KEY, run_id INTEGER, url TEXT, host TEXT, status INTEGER, title TEXT, server TEXT, technologies TEXT, content_type TEXT, content_length INTEGER, ip TEXT, final_url TEXT, raw_json TEXT, UNIQUE(run_id,url));
+        CREATE TABLE IF NOT EXISTS technologies(id INTEGER PRIMARY KEY, run_id INTEGER, host TEXT, url TEXT, name TEXT, version TEXT, category TEXT, source TEXT, confidence TEXT, evidence TEXT, first_seen TEXT, UNIQUE(run_id,host,url,name,version,source));
         CREATE TABLE IF NOT EXISTS endpoints(id INTEGER PRIMARY KEY, run_id INTEGER, url TEXT, host TEXT, path TEXT, query_keys TEXT, extension TEXT, source TEXT, first_seen TEXT, UNIQUE(run_id,url));
         CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, run_id INTEGER, tool TEXT, severity TEXT, template_id TEXT, name TEXT, matched_at TEXT, host TEXT, evidence TEXT, UNIQUE(run_id,tool,template_id,matched_at));
         CREATE TABLE IF NOT EXISTS domain_info(id INTEGER PRIMARY KEY, run_id INTEGER, key TEXT, value TEXT, source TEXT, UNIQUE(run_id,key,value,source));
@@ -121,11 +245,14 @@ class Database:
         CREATE TABLE IF NOT EXISTS input_points(id INTEGER PRIMARY KEY, run_id INTEGER, page_url TEXT, action_url TEXT, method TEXT, name TEXT, input_type TEXT, tested INTEGER DEFAULT 0, reflection_context TEXT, UNIQUE(run_id,page_url,action_url,method,name));
         CREATE TABLE IF NOT EXISTS encoded_artifacts(id INTEGER PRIMARY KEY, run_id INTEGER, source_url TEXT, location TEXT, kind TEXT, value_preview TEXT, decoded_preview TEXT, is_hash INTEGER DEFAULT 0, analyzer TEXT, UNIQUE(run_id,source_url,location,kind,value_preview));
         CREATE TABLE IF NOT EXISTS tool_runs(id INTEGER PRIMARY KEY, run_id INTEGER, stage TEXT, tool TEXT, command_json TEXT, started_at TEXT, duration REAL, exit_code INTEGER, status TEXT, stdout_path TEXT, stderr_path TEXT);
-        CREATE INDEX IF NOT EXISTS idx_assets_host ON assets(run_id,hostname); CREATE INDEX IF NOT EXISTS idx_endpoints_host ON endpoints(run_id,host);
+        CREATE INDEX IF NOT EXISTS idx_assets_host ON assets(run_id,hostname); CREATE INDEX IF NOT EXISTS idx_endpoints_host ON endpoints(run_id,host); CREATE INDEX IF NOT EXISTS idx_technologies_host ON technologies(run_id,host);
         """)
         port_columns={row[1] for row in self.conn.execute("PRAGMA table_info(ports)")}
         for name in ("state","reason","product","version","extra_info","cpe","scripts"):
             if name not in port_columns:self.conn.execute(f"ALTER TABLE ports ADD COLUMN {name} TEXT")
+        asset_columns={row[1] for row in self.conn.execute("PRAGMA table_info(assets)")}
+        for name,definition in (("http_active","INTEGER DEFAULT 0"),("active_url","TEXT"),("http_status","INTEGER")):
+            if name not in asset_columns:self.conn.execute(f"ALTER TABLE assets ADD COLUMN {name} {definition}")
         self.conn.commit()
 
     def start(self, domain: str, profile: str, config: dict[str, Any]) -> int:
@@ -160,6 +287,66 @@ class Config:
     active_max_urls: int
     active_delay: float
     repo_max: int
+    skip_stages: set[str] = dataclasses.field(default_factory=set)
+    scope_subdomains: tuple[str, ...] = ()
+    user_agent_file: Path | None = None
+
+
+STAGE_ALIASES = {
+    "subdomains": "subdomain_enum",
+    "subdomain-enum": "subdomain_enum",
+    "subdomain_enum": "subdomain_enum",
+    "dns": "dns",
+    "http": "http",
+    "ports": "ports",
+    "content": "content",
+    "technologies": "technologies",
+    "secrets": "secrets",
+    "tls": "tls",
+    "active": "active_checks",
+    "active-checks": "active_checks",
+    "active_checks": "active_checks",
+    "vulnerabilities": "vulnerabilities",
+}
+
+
+def canonical_scope_subdomain(value: str, domain: str) -> str:
+    value=value.strip().lower().rstrip(".")
+    if not value:return ""
+    if "://" in value:
+        host=urllib.parse.urlsplit(value).hostname or ""
+        value=host.lower().rstrip(".")
+    if not in_scope_host(value,domain) or not DOMAIN_RE.fullmatch(value):
+        raise ValueError(f"subdomain is outside scope or invalid: {value!r}")
+    return value
+
+
+def parse_stage_skips(value: str) -> set[str]:
+    result=set()
+    for raw in re.split(r"[\s,]+",value or ""):
+        if not raw:continue
+        key=raw.strip().lower()
+        if key not in STAGE_ALIASES:
+            raise ValueError(f"unknown skip stage: {raw}")
+        result.add(STAGE_ALIASES[key])
+    return result
+
+
+class UserAgentPool:
+    def __init__(self, path: Path | None = None):
+        base=Path(__file__).resolve().parent
+        candidates=[path] if path else []
+        candidates += [base/"user-agent.txt",base/"user-agents.txt"]
+        values=[]
+        for candidate in candidates:
+            if candidate and candidate.is_file():
+                values=[line.strip() for line in candidate.read_text(errors="replace").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+                if values:break
+        self.values=tuple(dict.fromkeys(values)) or (f"ReconPipeline/{VERSION} authorized-security-review",)
+
+    def choose(self, purpose: str = "authorized-security-review") -> str:
+        value=random.choice(self.values)
+        return value.replace("{purpose}",purpose)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,10 +442,19 @@ class Pipeline:
         self.raw = self.root / "raw"; self.inputs = self.root / "inputs"
         self.raw.mkdir(parents=True); self.inputs.mkdir()
         self.db = Database(self.root / "recon.sqlite3")
-        self.run_id = self.db.start(cfg.domain, cfg.profile, dataclasses.asdict(cfg) | {"output": str(cfg.output), "wordlist": str(cfg.wordlist) if cfg.wordlist else None, "skip": sorted(cfg.skip)})
-        self.done = 0; self.total = 24 if cfg.profile == "deep" else (6 if cfg.profile == "passive" else 15)
+        self.user_agents = UserAgentPool(cfg.user_agent_file)
+        self.run_id = self.db.start(cfg.domain, cfg.profile, dataclasses.asdict(cfg) | {"output": str(cfg.output), "wordlist": str(cfg.wordlist) if cfg.wordlist else None, "skip": sorted(cfg.skip), "skip_stages": sorted(cfg.skip_stages), "scope_subdomains": list(cfg.scope_subdomains), "user_agent_file": str(cfg.user_agent_file) if cfg.user_agent_file else None})
+        self.done = 0; self.total = 25 if cfg.profile == "deep" else (6 if cfg.profile == "passive" else 16)
         self.encoded_analyzed=0
         self.pipeline_started=time.monotonic()
+
+    def headers(self, purpose: str = "authorized-security-review", extra: dict[str,str] | None = None) -> dict[str,str]:
+        headers={"User-Agent":self.user_agents.choose(purpose),"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.7,*/*;q=0.1","Accept-Encoding":"identity","Connection":"close"}
+        if extra:headers.update(extra)
+        return headers
+
+    def user_agent(self, purpose: str = "authorized-security-review") -> str:
+        return self.user_agents.choose(purpose)
 
     def log(self, message: str, color: str = "cyan") -> None:
         use = sys.stderr.isatty() and not os.getenv("NO_COLOR")
@@ -307,6 +503,33 @@ class Pipeline:
         path.write_text("".join(f"{v}\n" for v in sorted(set(values))))
         return path
 
+    def seed_scope_assets(self) -> None:
+        seeds={self.cfg.domain,*self.cfg.scope_subdomains}
+        for host in sorted(seeds):
+            if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host):
+                self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"scope-input" if host!=self.cfg.domain else "apex",utcnow()))
+        self.db.conn.commit()
+
+    def record_stage(self, stage: str, status: str, message: str, duration: float = 0.0) -> None:
+        self.db.execute("INSERT INTO tool_runs(run_id,stage,tool,command_json,started_at,duration,exit_code,status,stdout_path,stderr_path) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.run_id,stage,"pipeline-stage",json.dumps({"message":message}),utcnow(),duration,None,status,"",""))
+        self.db.conn.commit()
+
+    async def run_step(self, stage_key: str, label: str, action: Any) -> None:
+        if stage_key in self.cfg.skip_stages:
+            self.log(f"{label}: stage skipped by scan policy","yellow")
+            self.record_stage(label,"skipped","stage skipped by scan policy")
+            self.done+=1
+            return
+        before=time.monotonic()
+        before_done=self.done
+        try:
+            await action()
+            if self.done==before_done:self.done+=1
+        except Exception as exc:
+            self.log(f"{label}: failed ({type(exc).__name__}: {exc}); continuing","red")
+            self.record_stage(label,"failed",f"{type(exc).__name__}: {exc}",time.monotonic()-before)
+            self.done+=1
+
     async def domain_intelligence(self) -> None:
         code,out=await self.run_tool("00-domain","whois",[self.cfg.domain],timeout=120)
         if code==0:
@@ -318,7 +541,7 @@ class Pipeline:
                 if key.lower() in wanted and value:
                     self.db.execute("INSERT OR IGNORE INTO domain_info(run_id,key,value,source) VALUES(?,?,?,?)",(self.run_id,key,value,"whois"))
         def rdap_lookup() -> dict[str,Any] | None:
-            request=urllib.request.Request("https://rdap.org/domain/"+urllib.parse.quote(self.cfg.domain),headers={"Accept":"application/rdap+json, application/json","User-Agent":f"ReconPipeline/{VERSION} authorized-security-review"})
+            request=urllib.request.Request("https://rdap.org/domain/"+urllib.parse.quote(self.cfg.domain),headers=self.headers("authorized-rdap",{"Accept":"application/rdap+json, application/json"}))
             try:
                 with urllib.request.urlopen(request,timeout=self.cfg.timeout) as response:
                     return json.loads(response.read(5_000_000))
@@ -450,8 +673,16 @@ class Pipeline:
         self.db.conn.commit(); self.done += 1
 
     async def resolve(self) -> None:
-        hosts = self.db.values("SELECT hostname FROM assets WHERE run_id=?", (self.run_id,)); inp = self.write_input("hosts.txt", hosts)
-        code, out = await self.run_tool("02-resolve", "dnsx", ["-l", str(inp), "-a", "-aaaa", "-cname", "-resp", "-json", "-silent", "-rl", str(self.cfg.rate), "-t", str(self.cfg.concurrency)])
+        hosts = self.db.values("SELECT hostname FROM assets WHERE run_id=?", (self.run_id,))
+        await self.resolve_host_batch(hosts,"dnsx-initial")
+        self.db.conn.commit(); self.done += 1
+
+    async def resolve_host_batch(self, hosts: Iterable[str], artifact_name: str) -> set[str]:
+        values=sorted({host for host in hosts if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host)})
+        if not values:return set()
+        inp=self.write_input(artifact_name+".txt",values)
+        code, out = await self.run_tool("02-resolve", "dnsx", ["-l", str(inp), "-a", "-aaaa", "-cname", "-resp", "-json", "-silent", "-rl", str(self.cfg.rate), "-t", str(self.cfg.concurrency)],artifact_name=artifact_name)
+        resolved=set()
         if code == 0:
             for row in json_lines(out):
                 host = str(row.get("host") or row.get("input") or "").lower()
@@ -460,8 +691,8 @@ class Pipeline:
                 for value in values:
                     typ = "AAAA" if ":" in str(value) else ("A" if re.fullmatch(r"[\d.]+",str(value)) else "CNAME")
                     self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)", (self.run_id,host,typ,str(value),"dnsx"))
-                if values: self.db.execute("UPDATE assets SET resolved=1 WHERE run_id=? AND hostname=?",(self.run_id,host))
-        self.db.conn.commit(); self.done += 1
+                if values:self.db.execute("UPDATE assets SET resolved=1 WHERE run_id=? AND hostname=?",(self.run_id,host));resolved.add(host)
+        self.db.conn.commit();return resolved
 
     async def active_dns_enumeration(self) -> None:
         """Resolve common subdomain labels with bundled Gobuster before dnsx."""
@@ -577,7 +808,7 @@ class Pipeline:
                     nmap_args=family_args+["-Pn","-n","-sT","-sV","--version-intensity","7","-sC","--script-timeout","2m","-T3","--max-rate",str(self.cfg.rate),"--max-retries","2","--host-timeout","45m","--open","-p-","-iL",str(ip_input),"-oX","-"]
                     nmap_timeout=max(7200,math.ceil(65535*len(family_ips)/max(1,self.cfg.rate))*2+self.cfg.timeout)
                 elif open_ports:
-                    nmap_args=family_args+["-Pn","-n","-sT","-sV","--version-light","-T3","--max-rate",str(self.cfg.rate),"--max-retries","2","--host-timeout","15m","--open","-p",",".join(map(str,open_ports)),"-iL",str(ip_input),"-oX","-"]
+                    nmap_args=family_args+["-Pn","-n","-sT","-sV","--version-intensity","7","-sC","--script-timeout","90s","-T3","--max-rate",str(self.cfg.rate),"--max-retries","2","--host-timeout","15m","--open","-p",",".join(map(str,open_ports)),"-iL",str(ip_input),"-oX","-"]
                     nmap_timeout=3600
                 else:continue
                 ncode,nstdout=await self.run_tool("03-services","nmap",nmap_args,timeout=nmap_timeout,artifact_name=f"nmap-{family}-detailed")
@@ -614,23 +845,76 @@ class Pipeline:
                           service=excluded.service,state=excluded.state,reason=excluded.reason,product=excluded.product,version=excluded.version,
                           extra_info=excluded.extra_info,cpe=excluded.cpe,scripts=excluded.scripts,source='naabu+nmap'""",
                           (self.run_id,hostname,ip,port,protocol,label,state,reason,product,version,extra,json.dumps(cpes),json.dumps(scripts,sort_keys=True),"nmap"))
+                        if product:self.add_technology(hostname,"",product,version,"nmap-service","high",label)
+                        for cpe in cpes:
+                            parsed_cpe=parse_cpe_technology(cpe)
+                            if parsed_cpe:self.add_technology(hostname,"",parsed_cpe[0],parsed_cpe[1],"nmap-cpe","high",cpe)
+                        for os_name in ("Ubuntu","Debian","CentOS","Red Hat","Windows Server","AlmaLinux","Rocky Linux"):
+                            match=re.search(rf"\b{re.escape(os_name)}\b(?:\s+([0-9][A-Za-z0-9._+-]*))?",extra,re.I)
+                            if match:self.add_technology(hostname,"",os_name,match.group(1) or "","nmap-service","medium",extra)
 
     async def probe(self) -> None:
-        hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=? AND resolved=1",(self.run_id,)); inp=self.write_input("http-targets.txt",hosts)
-        args=["-l",str(inp),"-json","-silent","-sc","-title","-server","-td","-ct","-cl","-ip","-cname","-cdn","-location","-fr","-rl",str(self.cfg.rate),"-t",str(self.cfg.concurrency),"-timeout",str(self.cfg.timeout)]
-        if self.cfg.screenshots:
-            args += ["-ss", "-esb", "-ehb", "-srd", str(self.raw / "screenshots")]
-        code,out=await self.run_tool("04-http","httpx",args,timeout=3600)
-        if code==0:
-            for row in json_lines(out):
-                url=canonical_url(str(row.get("url") or row.get("input") or ""),self.cfg.domain)
-                if not url: continue
-                p=urllib.parse.urlsplit(url);tech=row.get("tech",[]);tech=tech if isinstance(tech,list) else [tech]
-                cdn_raw=row.get("cdn_name") or row.get("cdn") or "";cdn_name=str(cdn_raw).strip() if isinstance(cdn_raw,str) else "";cdn_type=str(row.get("cdn_type") or "").strip()
-                if cdn_name:tech.append((cdn_type.upper()+":" if cdn_type else "CDN:")+cdn_name)
-                self.db.execute("INSERT OR REPLACE INTO http_services(run_id,url,host,status,title,server,technologies,content_type,content_length,ip,final_url,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(self.run_id,url,p.hostname,int(row.get("status_code") or 0),str(row.get("title") or ""),str(row.get("webserver") or ""),json.dumps(tech),str(row.get("content_type") or ""),int(row.get("content_length") or 0),str(row.get("host_ip") or row.get("ip") or ""),str(row.get("final_url") or row.get("location") or ""),json.dumps(row)))
-                self.add_endpoint(url,"httpx")
+        hosts=self.db.values("SELECT hostname FROM assets WHERE run_id=? AND resolved=1",(self.run_id,))
+        pending=set(hosts);seen=set()
+        for round_number in range(self.cfg.depth+1):
+            targets=sorted(pending-seen)
+            if not targets:break
+            seen.update(targets);discovered=await self.probe_http_batch(targets,f"httpx-round-{round_number+1:02d}",screenshots=self.cfg.screenshots and round_number==0)
+            candidates=[]
+            for host in sorted(discovered):
+                row=self.db.conn.execute("SELECT resolved,http_active FROM assets WHERE run_id=? AND hostname=?",(self.run_id,host)).fetchone()
+                if not row:self.db.execute("INSERT INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"httpx-recursive",utcnow()));candidates.append(host)
+                elif not row["resolved"]:candidates.append(host)
+            resolved=await self.resolve_host_batch(candidates,f"dnsx-httpx-round-{round_number+1:02d}")
+            pending={host for host in resolved if host not in seen}
         self.db.conn.commit(); self.done+=1
+
+    async def probe_open_ports(self) -> None:
+        targets=[f"{row['hostname']}:{row['port']}" for row in self.db.conn.execute("SELECT DISTINCT hostname,port FROM ports WHERE run_id=? AND state='open' AND port NOT IN (80,443) ORDER BY hostname,port",(self.run_id,))]
+        discovered=await self.probe_http_batch(targets,"httpx-open-ports");seen=set()
+        for round_number in range(self.cfg.depth):
+            candidates=[]
+            for host in sorted(discovered-seen):
+                seen.add(host);row=self.db.conn.execute("SELECT resolved,http_active FROM assets WHERE run_id=? AND hostname=?",(self.run_id,host)).fetchone()
+                if not row:self.db.execute("INSERT INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"httpx-port-recursive",utcnow()));candidates.append(host)
+                elif not row["resolved"]:candidates.append(host)
+                elif not row["http_active"]:candidates.append(host)
+            resolved=await self.resolve_host_batch(candidates,f"dnsx-httpx-open-ports-{round_number+1:02d}")
+            probe_targets=set(resolved)|{host for host in candidates if self.db.conn.execute("SELECT resolved FROM assets WHERE run_id=? AND hostname=?",(self.run_id,host)).fetchone()[0]}
+            if not probe_targets:break
+            discovered=await self.probe_http_batch(probe_targets,f"httpx-open-port-discoveries-{round_number+1:02d}")
+        self.db.conn.commit();self.done+=1
+
+    async def probe_http_batch(self, targets: Iterable[str], artifact_name: str, screenshots: bool = False) -> set[str]:
+        values=sorted(set(targets));discovered=set()
+        if not values:return discovered
+        inp=self.write_input(artifact_name+".txt",values)
+        args=["-l",str(inp),"-json","-silent","-nf","-efqdn","-sc","-title","-server","-td","-cpe","-ct","-cl","-ip","-cname","-cdn","-location","-fhr","-maxr","5","-http2","-pipeline","-H",f"User-Agent: {self.user_agent('authorized-http-probe')}","-rl",str(self.cfg.rate),"-t",str(self.cfg.concurrency),"-timeout",str(self.cfg.timeout),"-retries","1","-rstr",str(min(self.cfg.secret_max_bytes,2_000_000))]
+        if screenshots:args += ["-ss","-esb","-ehb","-srd",str(self.raw/"screenshots")]
+        code,out=await self.run_tool("04-http","httpx",args,timeout=3600,executable=self.tool("httpx"),artifact_name=artifact_name)
+        if code!=0:return discovered
+        for row in json_lines(out):
+            url=canonical_url(str(row.get("url") or row.get("input") or ""),self.cfg.domain)
+            if not url:continue
+            p=urllib.parse.urlsplit(url);tech=row.get("tech",[]);tech=tech if isinstance(tech,list) else [tech]
+            for cpe in row.get("cpe",[]) if isinstance(row.get("cpe"),list) else []:
+                if cpe:tech.append(str(cpe))
+            cdn_raw=row.get("cdn_name") or row.get("cdn") or "";cdn_name=str(cdn_raw).strip() if isinstance(cdn_raw,str) else "";cdn_type=str(row.get("cdn_type") or "").strip()
+            if cdn_name:tech.append((cdn_type.upper()+":" if cdn_type else "CDN:")+cdn_name)
+            status=int(row.get("status_code") or 0)
+            self.db.execute("INSERT OR REPLACE INTO http_services(run_id,url,host,status,title,server,technologies,content_type,content_length,ip,final_url,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(self.run_id,url,p.hostname,status,str(row.get("title") or ""),str(row.get("webserver") or ""),json.dumps(sorted(set(tech),key=str.lower)),str(row.get("content_type") or ""),int(row.get("content_length") or 0),str(row.get("host_ip") or row.get("ip") or ""),str(row.get("final_url") or row.get("location") or ""),json.dumps(row)))
+            self.infer_http_technologies(url,row);self.sync_service_technologies(url)
+            current=self.db.conn.execute("SELECT active_url,http_status FROM assets WHERE run_id=? AND hostname=?",(self.run_id,p.hostname)).fetchone();prior=str(current[0] or "") if current else "";prior_status=int(current[1] or 0) if current else 0
+            active_url=url if not prior or (url.startswith("https://") and not prior.startswith("https://")) else prior
+            active_status=status if active_url==url else prior_status
+            self.db.execute("UPDATE assets SET http_active=1,active_url=?,http_status=? WHERE run_id=? AND hostname=?",(active_url,active_status,self.run_id,p.hostname))
+            self.add_endpoint(url,"httpx")
+            for key in ("body_fqdn","body_domains"):
+                items=row.get(key,[]);items=items if isinstance(items,list) else [items]
+                for value in items:
+                    host=str(value).lower().strip().rstrip(".")
+                    if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host):discovered.add(host)
+        self.db.conn.commit();return discovered
 
     def add_endpoint(self, url: str, source: str) -> None:
         current=self.db.conn.execute("SELECT COUNT(*) FROM endpoints WHERE run_id=?",(self.run_id,)).fetchone()[0]
@@ -639,6 +923,70 @@ class Pipeline:
         if not url:return
         p=urllib.parse.urlsplit(url); keys=sorted({k for k,_ in urllib.parse.parse_qsl(p.query,keep_blank_values=True)}); ext=Path(p.path).suffix.lower().lstrip(".")
         self.db.execute("INSERT OR IGNORE INTO endpoints(run_id,url,host,path,query_keys,extension,source,first_seen) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,url,p.hostname,p.path,json.dumps(keys),ext,source,utcnow()))
+
+    def add_technology(self, host: str, url: str | None, name: str, version: str = "", source: str = "detector", confidence: str = "medium", evidence: str = "") -> None:
+        host=str(host or "").lower().rstrip(".")
+        if not host or not in_scope_host(host,self.cfg.domain):
+            return
+        url=canonical_url(url,self.cfg.domain) if url else ""
+        name, parsed_version = split_technology_label(name)
+        version=clean_version(version) or parsed_version
+        name=" ".join(name.strip().split())
+        if not name or name.lower() in WHATWEB_METADATA_PLUGINS:
+            return
+        category=technology_category(name)
+        self.db.execute("""INSERT INTO technologies(run_id,host,url,name,version,category,source,confidence,evidence,first_seen)
+          VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,host,url,name,version,source) DO UPDATE SET
+          confidence=excluded.confidence,evidence=CASE WHEN excluded.evidence!='' THEN excluded.evidence ELSE technologies.evidence END""",
+          (self.run_id,host,url,name,version,category,source,confidence,evidence[:1000],utcnow()))
+
+    def sync_service_technologies(self, url: str) -> None:
+        service=self.db.conn.execute("SELECT host,server,technologies FROM http_services WHERE run_id=? AND url=?",(self.run_id,url)).fetchone()
+        if not service:
+            return
+        labels=[]
+        try:labels.extend(json.loads(service["technologies"] or "[]"))
+        except json.JSONDecodeError:pass
+        for row in self.db.conn.execute("SELECT name,version FROM technologies WHERE run_id=? AND host=? AND (url=? OR url='')",(self.run_id,service["host"],url)):
+            labels.append(technology_label(row["name"],row["version"]))
+        for name,version in parse_server_technology(str(service["server"] or "")):
+            labels.append(technology_label(name,version))
+        self.db.execute("UPDATE http_services SET technologies=? WHERE run_id=? AND url=?",(json.dumps(sorted({x for x in labels if x},key=str.lower)),self.run_id,url))
+
+    def infer_http_technologies(self, url: str, row: dict[str, Any]) -> None:
+        parsed=urllib.parse.urlsplit(url);host=parsed.hostname or ""
+        server=str(row.get("webserver") or row.get("server") or "")
+        for name,version in parse_server_technology(server):
+            self.add_technology(host,url,name,version,"httpx-header","high",server)
+        tech=row.get("tech",[])
+        tech=tech if isinstance(tech,list) else [tech]
+        for item in tech:
+            name,version=split_technology_label(str(item))
+            self.add_technology(host,url,name,version,"httpx-wappalyzer","medium",str(item))
+        cpes=row.get("cpe",[]) if isinstance(row.get("cpe"),list) else []
+        for cpe in cpes:
+            parsed_cpe=parse_cpe_technology(str(cpe))
+            if parsed_cpe:
+                self.add_technology(host,url,parsed_cpe[0],parsed_cpe[1],"httpx-cpe","high",str(cpe))
+
+    async def deep_http_technology_probe(self) -> None:
+        rows=self.db.conn.execute("SELECT url,host,server FROM http_services WHERE run_id=? ORDER BY url LIMIT ?",(self.run_id,min(100,self.cfg.secret_max_files))).fetchall()
+        if not rows:
+            return
+        delay=1/max(1,self.cfg.rate)
+        for row in rows:
+            for name,version in parse_server_technology(str(row["server"] or "")):
+                self.add_technology(str(row["host"]),str(row["url"]),name,version,"server-header","high",str(row["server"] or ""))
+            result=self.fetch_text(str(row["url"]))
+            await asyncio.sleep(delay)
+            if not result:
+                continue
+            final,text=result
+            for name,version,evidence in extract_body_technologies(final,text):
+                confidence="high" if version or "generator" in evidence.lower() else "medium"
+                self.add_technology(str(row["host"]),str(row["url"]),name,version,"page-source",confidence,evidence)
+        for row in rows:
+            self.sync_service_technologies(str(row["url"]))
 
     def add_repository(self, value: str, source: str) -> None:
         try:
@@ -691,7 +1039,7 @@ class Pipeline:
         urls=self.db.values("SELECT url FROM http_services WHERE run_id=?",(self.run_id,)); inp=self.write_input("live-urls.txt",urls)
         output=self.raw/"whatweb.json"
         aggression=3 if self.cfg.profile=="deep" else 1
-        args=["--log-json="+str(output),"--no-errors",f"--aggression={aggression}","--follow-redirect=same-site",f"--open-timeout={self.cfg.timeout}",f"--read-timeout={self.cfg.timeout}",f"--user-agent=ReconPipeline/{VERSION} authorized-technology-inventory","--input-file="+str(inp)]
+        args=["--log-json="+str(output),"--no-errors",f"--aggression={aggression}","--follow-redirect=same-site",f"--open-timeout={self.cfg.timeout}",f"--read-timeout={self.cfg.timeout}",f"--user-agent={self.user_agent('authorized-technology-inventory')}","--input-file="+str(inp)]
         if self.cfg.profile=="deep":args += ["--max-threads=1",f"--wait={max(0.01,1/self.cfg.rate):.3f}"]
         else:args += [f"--max-threads={min(25,self.cfg.concurrency,self.cfg.rate)}"]
         await self.run_tool("06-tech","whatweb",args,timeout=3600 if self.cfg.profile=="deep" else 1800)
@@ -708,12 +1056,17 @@ class Pipeline:
                     versions=versions if isinstance(versions,list) else [versions]
                     label=str(name)+(":"+",".join(str(v) for v in versions if v) if any(versions) else "")
                     labels.append(label)
+                    if any(versions):
+                        for version in versions:self.add_technology(urllib.parse.urlsplit(url).hostname or "",url,str(name),str(version),"whatweb","high",label)
+                    else:self.add_technology(urllib.parse.urlsplit(url).hostname or "",url,str(name),"","whatweb","medium",label)
                 existing=self.db.conn.execute("SELECT technologies FROM http_services WHERE run_id=? AND url=?",(self.run_id,url)).fetchone()
                 prior=[]
                 if existing:
                     try:prior=json.loads(existing[0] or "[]")
                     except json.JSONDecodeError:pass
                 self.db.execute("UPDATE http_services SET technologies=? WHERE run_id=? AND url=?",(json.dumps(sorted(set(prior+labels),key=str.lower)),self.run_id,url))
+                self.sync_service_technologies(url)
+        await self.deep_http_technology_probe()
         self.db.conn.commit()
         self.done+=1
 
@@ -779,7 +1132,7 @@ class Pipeline:
                 self.db.execute("INSERT OR IGNORE INTO input_points(run_id,page_url,action_url,method,name,input_type) VALUES(?,?,?,?,?,?)",(self.run_id,page_url,action,method,str(field["name"])[:200],str(field["type"])[:40]))
 
     def fetch_probe(self, url: str) -> tuple[int,str] | None:
-        request=urllib.request.Request(url,headers={"User-Agent":f"ReconPipeline/{VERSION} authorized-input-analysis","Accept":"text/html,text/plain,application/json","Accept-Encoding":"identity"})
+        request=urllib.request.Request(url,headers=self.headers("authorized-input-analysis",{"Accept":"text/html,text/plain,application/json"}))
         opener=urllib.request.build_opener(ScopedRedirect(self.cfg.domain),urllib.request.HTTPSHandler(context=ssl.create_default_context()))
         try:
             with opener.open(request,timeout=self.cfg.timeout) as response:
@@ -833,7 +1186,7 @@ class Pipeline:
         return found
 
     def fetch_text(self, url: str) -> tuple[str,str] | None:
-        request=urllib.request.Request(url,headers={"User-Agent":f"ReconPipeline/{VERSION} authorized-security-review","Accept":"text/html,application/javascript,application/json,text/plain,application/xml;q=0.9,*/*;q=0.1","Accept-Encoding":"identity"})
+        request=urllib.request.Request(url,headers=self.headers("authorized-security-review",{"Accept":"text/html,application/javascript,application/json,text/plain,application/xml;q=0.9,*/*;q=0.1"}))
         opener=urllib.request.build_opener(ScopedRedirect(self.cfg.domain),urllib.request.HTTPSHandler(context=ssl.create_default_context()))
         try:
             with opener.open(request,timeout=self.cfg.timeout) as response:
@@ -873,7 +1226,7 @@ class Pipeline:
         mantra_targets=[u for u in targets if Path(urllib.parse.urlsplit(u).path).suffix.lower() in {".js",".mjs",".json",".map"}][:500]
         if mantra_targets and mantra and "mantra" not in self.cfg.skip:
             mantra_input=self.write_input("mantra-urls.txt",mantra_targets)
-            _,mantra_out=await self.run_tool("07-secrets","mantra",["-s","-t",str(min(5,self.cfg.concurrency)),"-ua",f"ReconPipeline/{VERSION}"],timeout=1800,stdin=mantra_input,executable=mantra)
+            _,mantra_out=await self.run_tool("07-secrets","mantra",["-s","-t",str(min(5,self.cfg.concurrency)),"-ua",self.user_agent("authorized-secret-analysis")],timeout=1800,stdin=mantra_input,executable=mantra)
             safe_lines=[]
             for raw_line in mantra_out.read_text(errors="replace").splitlines():
                 line=re.sub(r"\x1b\[[0-9;]*m","",raw_line);url_match=URL_RE.search(line)
@@ -969,18 +1322,85 @@ class Pipeline:
         self.db.conn.commit();self.done+=1
 
     async def nikto_checks(self) -> None:
-        urls=self.db.values("SELECT url FROM http_services WHERE run_id=? ORDER BY url LIMIT 5",(self.run_id,));nikto=self.tool("nikto")
-        if not urls or not nikto or "nikto" in self.cfg.skip:self.log("18-nikto: unavailable/no targets/skipped","yellow");self.done+=1;return
-        for idx,url in enumerate(urls):
-            report=self.raw/f"nikto-{idx:03d}.xml"
-            await self.run_tool("18-nikto",f"nikto-{idx:03d}",["-host",url,"-nointeractive","-ask","no","-Pause",str(self.cfg.active_delay),"-maxtime","5m","-timeout",str(self.cfg.timeout),"-Tuning","123b","-Format","xml","-output",str(report)],timeout=600,executable=nikto)
-            if report.exists():
-                try:root=ET.parse(report).getroot()
-                except ET.ParseError:continue
-                for item in root.findall(".//item"):
-                    desc=" ".join((item.findtext("description") or "").split());uri=item.findtext("uri") or url
-                    if desc:self.add_tool_finding("nikto","info","Nikto observation",urllib.parse.urljoin(url,uri),desc)
+        targets=self.nikto_targets();nikto=self.nikto_executable()
+        if not targets or not nikto or "nikto" in self.cfg.skip:self.log("18-nikto: unavailable/no targets/skipped","yellow");self.done+=1;return
+        self.log(f"18-nikto: scanning {len(targets)} prioritized web service(s)")
+        for idx,target in enumerate(targets):
+            report=self.raw/f"nikto-{idx:03d}.xml";tuning=self.nikto_tuning(target);maxtime=max(180,min(900,self.cfg.timeout*30))
+            args=["-host",target["url"],"-nointeractive","-ask","no","-Pause",f"{max(self.cfg.active_delay,1/max(1,self.cfg.rate)):.2f}","-maxtime",f"{maxtime}s","-timeout",str(self.cfg.timeout),"-Tuning",tuning,"-Display","V","-Format","xml","-output",str(report),"-useragent",self.user_agent("authorized-nikto-scan")]
+            await self.run_tool("18-nikto",f"nikto-{idx:03d}",args,timeout=maxtime+120,executable=nikto,cwd=self.nikto_cwd(),env=self.nikto_env())
+            if report.exists():self.ingest_nikto_xml(report,target["url"])
         self.db.conn.commit();self.done+=1
+
+    def nikto_executable(self) -> str | None:
+        base=Path(__file__).resolve().parent
+        local=base/"tools/nikto/program/nikto.pl"
+        if local.is_file() and os.access(local,os.X_OK):return str(local)
+        if local.is_file():return str(local)
+        return self.tool("nikto")
+
+    def nikto_cwd(self) -> Path | None:
+        base=Path(__file__).resolve().parent/"tools/nikto/program"
+        return base if base.exists() else None
+
+    def nikto_env(self) -> dict[str,str] | None:
+        base=Path(__file__).resolve().parent/"tools/nikto/perl5/lib/perl5"
+        if not base.exists():return None
+        env=os.environ.copy();prior=env.get("PERL5LIB","")
+        env["PERL5LIB"]=str(base)+(os.pathsep+prior if prior else "")
+        return env
+
+    def nikto_targets(self) -> list[dict[str,Any]]:
+        services=[dict(row) for row in self.db.conn.execute("SELECT url,host,status,server,technologies FROM http_services WHERE run_id=? ORDER BY status,url",(self.run_id,))]
+        endpoint_counts=collections.Counter()
+        parameter_counts=collections.Counter()
+        for row in self.db.conn.execute("SELECT url,query_keys FROM endpoints WHERE run_id=?",(self.run_id,)):
+            try:p=urllib.parse.urlsplit(str(row["url"]));origin=urllib.parse.urlunsplit((p.scheme,p.netloc,"/","",""))
+            except ValueError:continue
+            endpoint_counts[origin]+=1
+            if str(row["query_keys"] or "[]")!="[]":parameter_counts[origin]+=1
+        targets=[]
+        for service in services:
+            url=str(service.get("url") or "")
+            try:
+                p=urllib.parse.urlsplit(url);origin=urllib.parse.urlunsplit((p.scheme,p.netloc,"/","",""))
+            except ValueError:continue
+            tech=str(service.get("technologies") or "").lower();server=str(service.get("server") or "")
+            score=endpoint_counts[origin]+parameter_counts[origin]*3+(5 if any(x in tech for x in ("wordpress","joomla","drupal","php","apache","nginx")) else 0)+(2 if server else 0)
+            targets.append({**service,"origin":origin,"score":score})
+        seen=set();result=[]
+        for target in sorted(targets,key=lambda item:(-int(item["score"]),item["url"])):
+            origin=target["origin"]
+            if origin in seen:continue
+            seen.add(origin);result.append(target)
+        limit=8 if self.cfg.profile=="deep" else 4
+        return result[:limit]
+
+    def nikto_tuning(self, target: dict[str,Any]) -> str:
+        tech=str(target.get("technologies") or "").lower()
+        tuning=set("1234567890ab")
+        if not any(word in tech for word in ("php","wordpress","joomla","drupal","apache","nginx","iis","tomcat")):
+            tuning-=set("79")
+        return "".join(ch for ch in "1234567890abcx" if ch in tuning)
+
+    def nikto_severity(self, item: ET.Element) -> str:
+        text=" ".join(" ".join((item.findtext(name) or "").lower().split()) for name in ("description","osvdbid","id","namelink"))
+        if any(word in text for word in ("remote command","sql injection","xss","shell","rce","authentication bypass","upload")):return "high"
+        if any(word in text for word in ("default file","admin","password","disclosure","directory indexing","backup","config","outdated","allowed methods")):return "medium"
+        if any(word in text for word in ("header","cookie","httponly","samesite","x-frame-options","csp")):return "low"
+        return "info"
+
+    def ingest_nikto_xml(self, report: Path, base_url: str) -> None:
+        try:root=ET.parse(report).getroot()
+        except (OSError,ET.ParseError):self.log("18-nikto: could not parse XML report; raw output preserved","yellow");return
+        for item in root.findall(".//item"):
+            desc=" ".join((item.findtext("description") or "").split())
+            uri=item.findtext("uri") or item.findtext("iplink") or base_url
+            if not desc:continue
+            matched=canonical_url(urllib.parse.urljoin(base_url,uri),self.cfg.domain) or base_url
+            item_id=item.get("id") or item.findtext("id") or item.get("osvdbid") or item.findtext("osvdbid") or hashlib.sha256((desc+matched).encode()).hexdigest()[:12]
+            evidence={child.tag:" ".join((child.text or "").split()) for child in list(item) if child.text}
+            self.db.execute("INSERT OR IGNORE INTO findings(run_id,tool,severity,template_id,name,matched_at,host,evidence) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,"nikto",self.nikto_severity(item),f"nikto:{item_id}",desc[:500],matched,urllib.parse.urlsplit(matched).hostname or "",json.dumps(evidence,sort_keys=True)[:8000]))
 
     def active_candidates(self) -> list[str]:
         dynamic={"callback","cat","category","dir","file","id","item","keyword","lang","page","path","q","query","redirect","ref","return","s","search","sort","url","view"}
@@ -995,6 +1415,114 @@ class Pipeline:
             seen.add(signature);score=10*len(keys&dynamic)+len(keys)
             ranked.append((score,url))
         return [url for _,url in sorted(ranked,key=lambda x:(-x[0],x[1]))[:self.cfg.active_max_urls]]
+
+    def wapiti_executable(self) -> str | None:
+        base=Path(__file__).resolve().parent
+        candidates=[base/"tools/wapiti/.venv/bin/wapiti",base/"venv/bin/wapiti"]
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate,os.X_OK):return str(candidate)
+        return self.tool("wapiti")
+
+    def wapiti_origin_targets(self) -> list[dict[str,Any]]:
+        parameterized=set(self.active_candidates())
+        services=[dict(row) for row in self.db.conn.execute("SELECT url,host,status,server,technologies FROM http_services WHERE run_id=? ORDER BY status,url",(self.run_id,))]
+        endpoint_rows=self.db.conn.execute("SELECT url,host,query_keys,extension FROM endpoints WHERE run_id=? ORDER BY id DESC LIMIT ?",(self.run_id,self.cfg.max_urls)).fetchall()
+        inputs=self.db.conn.execute("SELECT action_url,input_type,name FROM input_points WHERE run_id=?",(self.run_id,)).fetchall()
+        by_origin:dict[tuple[str,str,int],dict[str,Any]]={}
+
+        def origin_key(url: str) -> tuple[str,str,int] | None:
+            try:
+                p=urllib.parse.urlsplit(url);port=p.port or (443 if p.scheme=="https" else 80)
+                if p.scheme not in {"http","https"} or not p.hostname:return None
+                return p.scheme,p.hostname,port
+            except ValueError:return None
+
+        for service in services:
+            key=origin_key(str(service["url"]))
+            if not key:continue
+            p=urllib.parse.urlsplit(str(service["url"]))
+            root=urllib.parse.urlunsplit((p.scheme,p.netloc,"/","",""))
+            entry=by_origin.setdefault(key,{"base":root,"host":p.hostname,"service":service,"starts":set(),"score":0,"extensions":set(),"inputs":set(),"technologies":set()})
+            entry["starts"].add(str(service["url"]));entry["score"]+=3 if int(service.get("status") or 0) in FFUF_VALID_STATUSES else 1
+            try:entry["technologies"].update(json.loads(service.get("technologies") or "[]"))
+            except json.JSONDecodeError:pass
+        for row in endpoint_rows:
+            url=str(row["url"]);key=origin_key(url)
+            if not key or key not in by_origin:continue
+            entry=by_origin[key];entry["starts"].add(url);entry["extensions"].add(str(row["extension"] or "").lower())
+            try:keys=json.loads(row["query_keys"] or "[]")
+            except json.JSONDecodeError:keys=[]
+            if keys:entry["score"]+=5
+            if url in parameterized:entry["score"]+=8
+        for row in inputs:
+            url=str(row["action_url"]);key=origin_key(url)
+            if not key or key not in by_origin:continue
+            entry=by_origin[key];entry["starts"].add(url);entry["inputs"].add(str(row["input_type"] or "").lower());entry["score"]+=6
+        targets=[]
+        for entry in by_origin.values():
+            starts=sorted(entry["starts"],key=lambda url:(0 if url in parameterized else 1,len(url),url))[:12]
+            if starts:targets.append({**entry,"starts":starts})
+        return sorted(targets,key=lambda item:(-int(item["score"]),item["base"]))[:max(1,min(5,self.cfg.active_max_urls))]
+
+    def wapiti_modules_for_target(self, target: dict[str,Any]) -> list[str]:
+        modules=set(WAPITI_BASE_MODULES)
+        starts=set(target.get("starts") or [])
+        has_parameters=any("?" in url for url in starts)
+        has_inputs=bool(target.get("inputs"))
+        if has_parameters or has_inputs:modules.update(WAPITI_PARAMETER_MODULES)
+        extensions={str(ext).lower() for ext in target.get("extensions",set())}
+        if extensions & {"xml","json"} or has_inputs:modules.update(WAPITI_BODY_MODULES)
+        if {"file","upload"} & {str(x).lower() for x in target.get("inputs",set())}:modules.update(WAPITI_UPLOAD_MODULES)
+        tech_blob=" ".join(str(x).lower() for x in target.get("technologies",set()))
+        if any(word in tech_blob for word in ("java","spring","log4j","tomcat")):modules.update(WAPITI_TECH_MODULES)
+        if any(word in tech_blob for word in ("wordpress","drupal","joomla","magento","prestashop","spip","typo3")):modules.add("cms")
+        return sorted(modules)
+
+    def wapiti_severity(self, level: Any, bucket: str) -> str:
+        try:return WAPITI_LEVELS.get(int(level),"medium" if bucket=="vulnerabilities" else "info")
+        except (TypeError,ValueError):return "medium" if bucket=="vulnerabilities" else "info"
+
+    def ingest_wapiti_report(self, path: Path, base_url: str) -> None:
+        try:data=json.loads(path.read_text(errors="replace"))
+        except (OSError,json.JSONDecodeError):return
+        classifications=data.get("classifications",{}) if isinstance(data,dict) else {}
+        for bucket,default_tool in (("vulnerabilities","wapiti"),("anomalies","wapiti-anomaly"),("additionals","wapiti-info")):
+            groups=data.get(bucket,{}) if isinstance(data,dict) else {}
+            if not isinstance(groups,dict):continue
+            for category,items in groups.items():
+                if not isinstance(items,list):continue
+                meta=classifications.get(category,{}) if isinstance(classifications,dict) else {}
+                for item in items:
+                    if not isinstance(item,dict):continue
+                    path_value=str(item.get("path") or item.get("url") or base_url)
+                    matched=canonical_url(urllib.parse.urljoin(base_url,path_value),self.cfg.domain) or base_url
+                    module=str(item.get("module") or default_tool)
+                    info=str(item.get("info") or category or module)
+                    parameter=str(item.get("parameter") or "")
+                    evidence={"category":category,"module":module,"parameter":parameter,"info":info,"wstg":item.get("wstg"),"curl_command":item.get("curl_command"),"classification":meta}
+                    severity=self.wapiti_severity(item.get("level"),bucket)
+                    name=f"{category}: {info}" if category and category not in info else info
+                    self.db.execute("INSERT OR IGNORE INTO findings(run_id,tool,severity,template_id,name,matched_at,host,evidence) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,default_tool,severity,f"wapiti:{module}:{category}",name[:500],matched,urllib.parse.urlsplit(matched).hostname or "",json.dumps(evidence,sort_keys=True)[:8000]))
+
+    async def wapiti_checks(self) -> None:
+        executable=self.wapiti_executable()
+        targets=self.wapiti_origin_targets()
+        if not executable or not targets or "wapiti" in self.cfg.skip:
+            self.log("11-wapiti: unavailable/no suitable targets/skipped","yellow");self.done+=1;return
+        self.log(f"11-wapiti: scanning {len(targets)} prioritized web origin(s) with adaptive modules")
+        for idx,target in enumerate(targets):
+            modules=self.wapiti_modules_for_target(target)
+            report=self.raw/f"wapiti-{idx:03d}.json";session_dir=self.root/"wapiti-sessions"/f"target-{idx:03d}";config_dir=self.root/"wapiti-config";session_dir.mkdir(parents=True,exist_ok=True);config_dir.mkdir(exist_ok=True)
+            scan_time=max(120,min(900,self.cfg.timeout*max(8,2+self.cfg.depth)))
+            attack_time=max(60,min(300,self.cfg.timeout*4))
+            args=["-u",str(target["base"]),"--scope","folder","-m",",".join(modules),"-d",str(min(self.cfg.depth,2)),"--max-scan-time",str(scan_time),"--max-attack-time",str(attack_time),"--max-links-per-page","30","--max-files-per-dir","15","--max-parameters","8","-S","polite","--tasks",str(max(1,min(4,self.cfg.concurrency))),"-t",str(self.cfg.timeout),"-A",self.user_agent("authorized-wapiti-scan"),"--verify-ssl","0","--store-session",str(session_dir),"--store-config",str(config_dir),"--flush-session","--no-bugreport","-f","json","-o",str(report),"-v","0"]
+            for start in target["starts"][:10]:
+                args += ["-s",str(start)]
+            code,_=await self.run_tool("11-wapiti","wapiti",args,timeout=scan_time+attack_time*max(1,len(modules))+120,executable=executable,artifact_name=f"wapiti-{idx:03d}",success_codes={0,1,2})
+            if report.exists():self.ingest_wapiti_report(report,str(target["base"]))
+            elif code!=0:self.log(f"11-wapiti: no JSON report for {target['base']}","yellow")
+            self.db.conn.commit()
+        self.done+=1
 
     def add_tool_finding(self, tool: str, severity: str, name: str, url: str, evidence: str) -> None:
         digest=hashlib.sha256((name+url+evidence).encode(errors="replace")).hexdigest()[:20]
@@ -1080,7 +1608,7 @@ class Pipeline:
         if not urls:self.log("08-content: no live web services to enumerate","yellow");self.done+=1;return
         for idx,url in enumerate(urls):
             base=url.rstrip("/")+"/FUZZ"; name=f"ffuf-{idx:03d}"
-            args=["-u",base,"-w",str(word),"-json","-s","-noninteractive","-ac","-ach","-mc","200-299,301,302,307,308,401,403,405","-recursion","-recursion-depth",str(self.cfg.depth),"-rate",str(self.cfg.rate),"-t",str(min(self.cfg.concurrency,40)),"-timeout",str(self.cfg.timeout)]
+            args=["-u",base,"-w",str(word),"-json","-s","-noninteractive","-H",f"User-Agent: {self.user_agent('authorized-content-discovery')}","-ac","-ach","-mc","200-299,301,302,307,308,401,403,405","-recursion","-recursion-strategy","default","-recursion-depth",str(self.cfg.depth),"-rate",str(self.cfg.rate),"-t",str(min(self.cfg.concurrency,40)),"-timeout",str(self.cfg.timeout)]
             code,out=await self.run_tool("08-content", "ffuf", args,timeout=max(3600,self.cfg.timeout*20),artifact_name=name)
             for result in json_lines(out):
                 try:status=int(result.get("status") or 0)
@@ -1092,20 +1620,46 @@ class Pipeline:
     async def run(self) -> None:
         status="failed"
         try:
-            await self.domain_intelligence();await self.recon_ng();await self.additional_osint();await self.enumerate()
+            self.seed_scope_assets()
+            steps=[
+                ("dns","00-domain",self.domain_intelligence),
+                ("subdomain_enum","00-recon-ng",self.recon_ng),
+                ("subdomain_enum","00-osint",self.additional_osint),
+                ("subdomain_enum","01-enumerate",self.enumerate),
+            ]
             if self.cfg.profile == "passive":
-                await self.resolve();await self.dns_intelligence()
+                steps += [("dns","02-resolve",self.resolve),("dns","02-dns",self.dns_intelligence)]
+                self.total=len(steps)
+                for stage_key,label,action in steps:await self.run_step(stage_key,label,action)
                 self.report(); status="complete"; self.log(f"complete: {self.root}","green"); return
-            if self.cfg.profile=="deep":await self.archive_discovery()
-            await self.active_dns_enumeration()
-            await self.resolve();await self.dns_intelligence()
-            await self.takeover_checks();await self.ports()
-            await self.probe(); await self.crawl(); await self.technologies()
-            if self.cfg.profile == "deep":await self.parameter_discovery()
-            await self.directories()
-            if self.cfg.profile=="deep":await self.javascript_analysis()
-            await self.secrets();await self.tls_checks()
-            if self.cfg.profile == "deep":await self.input_checks();await self.repository_secrets();await self.xss_checks();await self.sqli_checks();await self.nuclei();await self.nikto_checks()
+            if self.cfg.profile=="deep":steps.append(("subdomain_enum","01-archive",self.archive_discovery))
+            steps += [
+                ("subdomain_enum","01-active-dns",self.active_dns_enumeration),
+                ("dns","02-resolve",self.resolve),
+                ("dns","02-dns",self.dns_intelligence),
+                ("http","04-http",self.probe),
+                ("ports","03-ports",self.ports),
+                ("http","04-open-ports",self.probe_open_ports),
+                ("vulnerabilities","03-takeover",self.takeover_checks),
+                ("http","05-crawl",self.crawl),
+                ("technologies","06-tech",self.technologies),
+            ]
+            if self.cfg.profile == "deep":steps.append(("active_checks","09-parameters",self.parameter_discovery))
+            steps.append(("content","08-content",self.directories))
+            if self.cfg.profile=="deep":steps.append(("http","07-jsminer",self.javascript_analysis))
+            steps += [("secrets","07-secrets",self.secrets),("tls","10-tls",self.tls_checks)]
+            if self.cfg.profile == "deep":
+                steps += [
+                    ("active_checks","10-inputs",self.input_checks),
+                    ("secrets","08-repos",self.repository_secrets),
+                    ("active_checks","11-wapiti",self.wapiti_checks),
+                    ("active_checks","08-xss",self.xss_checks),
+                    ("active_checks","09-sqli",self.sqli_checks),
+                    ("vulnerabilities","12-nuclei",self.nuclei),
+                    ("vulnerabilities","18-nikto",self.nikto_checks),
+                ]
+            self.total=len(steps)
+            for stage_key,label,action in steps:await self.run_step(stage_key,label,action)
             self.report(); status="complete"; self.log(f"complete: {self.root}","green")
         except (KeyboardInterrupt, asyncio.CancelledError):
             status="cancelled"; raise
@@ -1114,8 +1668,9 @@ class Pipeline:
 
     def report(self) -> None:
         c=self.db.conn
-        counts={name:c.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",(self.run_id,)).fetchone()[0] for name,table in {"Domain facts":"domain_info","Assets":"assets","DNS records":"dns_records","Open ports":"ports","Web services":"http_services","Endpoints":"endpoints","Input points":"input_points","Encoded values":"encoded_artifacts","Repositories":"repositories","Findings":"findings"}.items()}
+        counts={name:c.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",(self.run_id,)).fetchone()[0] for name,table in {"Domain facts":"domain_info","Assets":"assets","DNS records":"dns_records","Open ports":"ports","Web services":"http_services","Technologies":"technologies","Endpoints":"endpoints","Input points":"input_points","Encoded values":"encoded_artifacts","Repositories":"repositories","Findings":"findings"}.items()}
         services=c.execute("SELECT * FROM http_services WHERE run_id=? ORDER BY host,url",(self.run_id,)).fetchall()
+        technologies=c.execute("SELECT * FROM technologies WHERE run_id=? ORDER BY host,category,name,version",(self.run_id,)).fetchall()
         ports=c.execute("SELECT * FROM ports WHERE run_id=? ORDER BY hostname,port",(self.run_id,)).fetchall()
         findings=c.execute("SELECT * FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",(self.run_id,)).fetchall()
         dns=c.execute("SELECT * FROM dns_records WHERE run_id=? ORDER BY hostname,type,value",(self.run_id,)).fetchall()
@@ -1137,6 +1692,7 @@ class Pipeline:
         doc=f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{esc(self.cfg.domain)} Recon Report</title><style>
         :root{{--bg:#08111d;--panel:#101e2e;--line:#233950;--text:#e8f0f8;--muted:#8da5b9;--accent:#28d7b7}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px system-ui}}main{{max-width:1400px;margin:auto;padding:32px}}h1{{font-size:34px;margin-bottom:5px}}h2{{margin-top:34px}}h3{{color:#b8cce0;margin-top:24px}}a{{color:#68e6cf}}.muted{{color:var(--muted)}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:28px 0}}.card{{padding:18px;background:linear-gradient(145deg,#122438,#0d1927);border:1px solid var(--line);border-radius:12px}}.card b{{display:block;font-size:27px;color:var(--accent)}}.card span{{color:var(--muted)}}.table{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;background:var(--panel)}}th,td{{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top}}tr:nth-child(even),.links>div:nth-child(even){{background:#0d1a28}}th{{position:sticky;top:0;background:#16293d;color:var(--accent)}}.links{{border:1px solid var(--line);border-radius:10px;overflow:hidden}}.links>div{{display:flex;gap:15px;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}}.links span{{color:var(--muted);white-space:nowrap}}code{{color:#9ce9dc}} </style></head><body><main><div class="muted">AUTHORIZED ATTACK-SURFACE INVENTORY · {esc(utcnow())}</div><h1>{esc(self.cfg.domain)}</h1><div class="muted">Profile: {esc(self.cfg.profile)} · Pipeline {VERSION}</div><div class="cards">{cards}</div>
         <h2>HTTP services</h2>{table(['URL','Status','Title','Server','Technologies'],((redact_url(r['url']),r['status'],r['title'],r['server'],r['technologies']) for r in services))}
+        <h2>Technology versions</h2>{table(['Host','URL','Name','Version','Category','Source','Confidence','Evidence'],((r['host'],redact_url(r['url']),r['name'],r['version'],r['category'],r['source'],r['confidence'],r['evidence']) for r in technologies))}
         <h2>Domain registration and ownership</h2>{table(['Field','Value','Source'],((r['key'],r['value'],r['source']) for r in domain_info))}
         <h2>DNS records</h2>{table(['Host','Type','Value','Source'],((r['hostname'],r['type'],r['value'],r['source']) for r in dns))}
         <h2>Open ports</h2>{table(['Host','IP','Port','Protocol','Service'],((r['hostname'],r['ip'],r['port'],r['protocol'],r['service']) for r in ports))}
@@ -1159,6 +1715,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--output",type=Path,default=Path("results"));p.add_argument("--rate",type=int,default=50);p.add_argument("--concurrency",type=int,default=30)
     p.add_argument("--timeout",type=int,default=10);p.add_argument("--depth",type=int,default=3);p.add_argument("--max-urls",type=int,default=5000)
     p.add_argument("--wordlist",type=Path);p.add_argument("--screenshots",action="store_true");p.add_argument("--skip",default="",help="comma-separated tool names")
+    p.add_argument("--skip-stages",default="",help="comma-separated stage groups to skip: subdomain_enum,dns,http,ports,content,technologies,secrets,tls,active_checks,vulnerabilities")
+    p.add_argument("--scope-subdomains",default="",help="comma/space/newline-separated in-scope hostnames to scan without discovering more")
+    p.add_argument("--scope-subdomains-file",type=Path,help="file containing in-scope hostnames to seed into the scan")
+    p.add_argument("--user-agent-file",type=Path,help="file containing one User-Agent per line; defaults to ./user-agent.txt when present")
     p.add_argument("--secret-max-files",type=int,default=2000,help="maximum in-scope text resources inspected for exposures")
     p.add_argument("--secret-max-bytes",type=int,default=2_000_000,help="maximum bytes read from each resource")
     p.add_argument("--active-max-urls",type=int,default=25,help="maximum deduplicated parameterized URLs for deep active checks")
@@ -1186,12 +1746,19 @@ def main(argv: list[str] | None = None) -> int:
     if not (1<=args.rate<=1000 and 1<=args.concurrency<=500 and 1<=args.timeout<=120 and 1<=args.depth<=10 and 10<=args.max_urls<=1_000_000 and 1<=args.secret_max_files<=100_000 and 1024<=args.secret_max_bytes<=20_000_000 and 1<=args.active_max_urls<=500 and 0.1<=args.active_delay<=30 and 0<=args.repo_max<=25):
         print("error: numeric option outside safe range",file=sys.stderr);return 2
     if args.wordlist and not args.wordlist.is_file(): print("error: wordlist does not exist",file=sys.stderr);return 2
+    if args.scope_subdomains_file and not args.scope_subdomains_file.is_file(): print("error: scope subdomains file does not exist",file=sys.stderr);return 2
+    if args.user_agent_file and not args.user_agent_file.is_file(): print("error: user agent file does not exist",file=sys.stderr);return 2
     try:
+        skip_stages=parse_stage_skips(args.skip_stages)
         for index,domain in enumerate(domains,1):
             if len(domains)>1:print(f"\n=== Target {index}/{len(domains)}: {domain} ===",file=sys.stderr,flush=True)
-            cfg=Config(domain,args.profile,args.output.resolve(),args.rate,args.concurrency,args.timeout,args.depth,args.max_urls,args.wordlist.resolve() if args.wordlist else None,args.screenshots,{x.strip().lower() for x in args.skip.split(",") if x.strip()},args.secret_max_files,args.secret_max_bytes,args.active_max_urls,args.active_delay,args.repo_max)
+            raw_scope=args.scope_subdomains
+            if args.scope_subdomains_file:raw_scope += "\n" + args.scope_subdomains_file.read_text(errors="replace")
+            scope=tuple(dict.fromkeys(canonical_scope_subdomain(value,domain) for value in re.split(r"[\s,]+",raw_scope) if value.strip()))
+            cfg=Config(domain,args.profile,args.output.resolve(),args.rate,args.concurrency,args.timeout,args.depth,args.max_urls,args.wordlist.resolve() if args.wordlist else None,args.screenshots,{x.strip().lower() for x in args.skip.split(",") if x.strip()},args.secret_max_files,args.secret_max_bytes,args.active_max_urls,args.active_delay,args.repo_max,skip_stages,scope,args.user_agent_file.resolve() if args.user_agent_file else None)
             asyncio.run(Pipeline(cfg).run())
         return 0
+    except ValueError as exc: print(f"error: {exc}",file=sys.stderr);return 2
     except KeyboardInterrupt: print("scan interrupted; partial results were preserved",file=sys.stderr);return 130
 
 

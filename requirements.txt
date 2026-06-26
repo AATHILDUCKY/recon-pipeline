@@ -18,18 +18,19 @@ dnsrecon==0.10.1
 #   whatweb     - supplemental technology detection
 #   whois, dig  - registration and DNS records
 #   sslscan     - supplemental TLS checks
-#   nikto       - bounded web-server checks
+#   tools/nikto/program/nikto.pl - bounded web-server checks
 #   dnsenum     - optional supplemental DNS enumeration
 #
 # Required only by the deep profile:
 #   nuclei      - template-based security observations
 #   ffuf        - recursive content discovery
 #   dalfox      - XSS analysis
+#   tools/wapiti/.venv/bin/wapiti - adaptive black-box web vulnerability scan
 #   SecLists    - wordlists, normally under /usr/share/wordlists/SecLists
 #   tools/XSStrike and tools/sqlmap are vendored Python applications.
 #   tools/bin contains locally built Gitleaks, TruffleHog and SubOver.
 #   tools/bin/mantra supplements JavaScript and HTML secret detection.
-#   tools/testssl.sh and tools/theHarvester are isolated vendored tools.
+#   tools/testssl.sh, tools/nikto and tools/theHarvester are isolated vendored tools.
 #
 # Optional functionality:
 #   A Chromium/Chrome installation is needed only when --screenshots is used.

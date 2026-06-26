@@ -24,7 +24,7 @@ from typing import Any, Callable
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 from markupsafe import Markup, escape
 
-from recon_pipeline import canonical_domain, redact_url
+from recon_pipeline import canonical_domain, canonical_scope_subdomain, redact_url
 
 BASE_DIR = Path(__file__).resolve().parent
 ACTIVE_STATUSES = ("queued", "running")
@@ -50,6 +50,38 @@ def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+SCAN_STAGE_CHOICES = (
+    ("subdomain_enum", "Subdomain enum"),
+    ("dns", "DNS"),
+    ("http", "HTTP probe"),
+    ("ports", "Ports"),
+    ("content", "Content"),
+    ("technologies", "Tech"),
+    ("secrets", "Secrets"),
+    ("tls", "TLS"),
+    ("active_checks", "Active checks"),
+    ("vulnerabilities", "Findings"),
+)
+
+
+def selected_scan_options(form: Any, domain: str) -> tuple[str, str]:
+    enabled=set(form.getlist("stages")) if hasattr(form,"getlist") else set()
+    if not enabled and str(form.get("stage_policy","")) != "1":
+        enabled={key for key,_ in SCAN_STAGE_CHOICES}
+    valid={key for key,_ in SCAN_STAGE_CHOICES}
+    skip_stages=sorted(valid-enabled)
+    raw_scope=str(form.get("scope_subdomains",""))
+    subdomains=[]
+    invalid=[]
+    for value in re.split(r"[\s,]+",raw_scope):
+        if not value.strip():continue
+        try:subdomains.append(canonical_scope_subdomain(value,domain))
+        except ValueError:invalid.append(value[:80])
+    if invalid:
+        raise ValueError(f"Invalid/out-of-scope subdomain(s): {', '.join(invalid[:5])}")
+    return ",".join(skip_stages), "\n".join(dict.fromkeys(subdomains))
+
+
 def connect_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -72,6 +104,8 @@ def init_db(path: Path) -> None:
           id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
           profile TEXT NOT NULL CHECK(profile IN ('passive','standard','deep')),
           request_rate INTEGER CHECK(request_rate BETWEEN 1 AND 500),
+          skip_stages TEXT,
+          scope_subdomains TEXT,
           status TEXT NOT NULL CHECK(status IN ('queued','running','complete','failed','cancelled')),
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, started_at TEXT, finished_at TEXT,
           result_dir TEXT, log_path TEXT, exit_code INTEGER, error TEXT
@@ -85,6 +119,10 @@ def init_db(path: Path) -> None:
         scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scans)")}
         if "request_rate" not in scan_columns:
             db.execute("ALTER TABLE scans ADD COLUMN request_rate INTEGER")
+        if "skip_stages" not in scan_columns:
+            db.execute("ALTER TABLE scans ADD COLUMN skip_stages TEXT")
+        if "scope_subdomains" not in scan_columns:
+            db.execute("ALTER TABLE scans ADD COLUMN scope_subdomains TEXT")
 
 
 def login_required(view: Callable[..., Any]) -> Callable[..., Any]:
@@ -155,6 +193,31 @@ def result_inventory(app: Flask, stored_dir: str | None) -> dict[str, set[str]]:
     return inventory
 
 
+def scan_result_dir(app: Flask, scan: sqlite3.Row | dict[str, Any]) -> str | None:
+    stored = (scan.get("result_dir") if isinstance(scan, dict) else (scan["result_dir"] if "result_dir" in scan.keys() else None)) or None
+    if stored:
+        return stored
+    target_id, scan_id = scan["target_id"], scan["id"]
+    root = Path(app.config["RESULTS_DIR"]) / f"target-{target_id}" / f"scan-{scan_id}"
+    databases = sorted(root.glob("*/recon.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(databases[0].parent) if databases else None
+
+
+def progress_summary(app: Flask, scan: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    stored_dir = scan_result_dir(app, scan)
+    data = read_results(app, stored_dir) if stored_dir else {"counts": {}, "tools": []}
+    tools = data.get("tools", [])
+    failures = [row for row in tools if row.get("status") in {"failed", "timeout"}]
+    skipped = [row for row in tools if row.get("status") == "skipped"]
+    counts = data.get("counts", {})
+    return {
+        "counts": {"subdomains": counts.get("Assets", 0), "services": counts.get("Web services", 0), "endpoints": counts.get("Endpoints", 0), "findings": counts.get("Findings", 0), "ports": counts.get("Ports", 0)},
+        "failures": failures[-8:],
+        "skipped": len(skipped),
+        "result_dir": stored_dir,
+    }
+
+
 TECH_METADATA = {"country", "email", "html5", "httpserver", "ip", "passwordfield", "script", "title", "uncommonheaders"}
 TECH_CATEGORY_RULES = (
     ("CMS & commerce", ("wordpress", "drupal", "joomla", "shopify", "magento", "woocommerce", "ghost", "contentful")),
@@ -204,8 +267,9 @@ def relevant_technology_findings(label: str, findings: list[dict[str,Any]]) -> l
     return [item for item in findings if pattern.search(" ".join(str(item.get(key) or "") for key in ("name","template_id","source")))]
 
 
-def build_technology_inventory(services: list[dict[str,Any]], findings: list[dict[str,Any]] | None = None) -> tuple[list[dict[str,Any]],list[dict[str,Any]],dict[str,int]]:
+def build_technology_inventory(services: list[dict[str,Any]], findings: list[dict[str,Any]] | None = None, technology_rows: list[dict[str,Any]] | None = None) -> tuple[list[dict[str,Any]],list[dict[str,Any]],dict[str,int]]:
     findings=findings or [];findings_by_host:dict[str,list[dict[str,Any]]]={}
+    technology_rows=technology_rows or []
     for item in findings:
         host=str(item.get("host") or "")
         if host:findings_by_host.setdefault(host,[]).append(item)
@@ -217,12 +281,24 @@ def build_technology_inventory(services: list[dict[str,Any]], findings: list[dic
         service["technology_list"]=technologies;service["technologies_display"]=" · ".join(technologies)
         entry=hosts.setdefault(host,{"host":host,"services":[],"technologies":set()})
         entry["services"].append(service);entry["technologies"].update(technologies)
+    tech_details:dict[tuple[str,str],dict[str,Any]]={}
+    for row in technology_rows:
+        host=str(row.get("host") or "")
+        if not host:continue
+        label=str(row.get("name") or "").strip()
+        version=str(row.get("version") or "").strip()
+        if version:label=f"{label}:{version}"
+        if not label:continue
+        entry=hosts.setdefault(host,{"host":host,"services":[],"technologies":set()})
+        entry["technologies"].add(label)
+        tech_details[(host,label.lower())]=row
     result=[]
     for host,entry in sorted(hosts.items()):
         categories:dict[str,list[dict[str,Any]]]={};host_findings=findings_by_host.get(host,[]);assessments=[]
         for label in sorted(entry["technologies"],key=str.lower):
             matches=relevant_technology_findings(label,host_findings);version=technology_version(label)
-            assessment={"name":label,"version":version,"status":"matched" if matches else ("versioned" if version else "unknown"),"findings":matches}
+            detail=tech_details.get((host,label.lower()),{})
+            assessment={"name":label,"version":version,"status":"matched" if matches else ("versioned" if version else "unknown"),"findings":matches,"source":detail.get("source",""),"confidence":detail.get("confidence",""),"evidence":detail.get("evidence","")}
             categories.setdefault(technology_category(label),[]).append(assessment);assessments.append(assessment);counts[label]=counts.get(label,0)+1
         security_findings=[item for item in host_findings if str(item.get("severity") or "").lower() in {"critical","high","medium"} or re.search(r"CVE-\d{4}-\d+",str(item.get("template_id") or item.get("name") or ""),re.I)]
         cves=sorted({cve.upper() for item in security_findings for cve in re.findall(r"CVE-\d{4}-\d+"," ".join(str(item.get(key) or "") for key in ("template_id","name")),flags=re.I)})
@@ -264,7 +340,7 @@ def build_ip_inventory(ports: list[dict[str,Any]], dns: list[dict[str,Any]]) -> 
 
 def read_results(app: Flask, stored_dir: str | None, previous_dir: str | None = None) -> dict[str, Any]:
     db_path = result_database(app, stored_dir)
-    empty = {"counts": {}, "services": [], "tech_stacks": [], "technology_summary": [], "technology_metrics": {"hosts":0,"fingerprinted_hosts":0,"technologies":0,"services":0,"versioned":0,"security_matches":0}, "ports": [], "ip_inventory": [], "ip_metrics": {"addresses":0,"ipv4":0,"ipv6":0,"open_ports":0,"services":0}, "dns": [], "findings": [],
+    empty = {"counts": {}, "active_subdomains": 0, "services": [], "technologies": [], "tech_stacks": [], "technology_summary": [], "technology_metrics": {"hosts":0,"fingerprinted_hosts":0,"technologies":0,"services":0,"versioned":0,"security_matches":0}, "ports": [], "ip_inventory": [], "ip_metrics": {"addresses":0,"ipv4":0,"ipv6":0,"open_ports":0,"services":0}, "dns": [], "findings": [],
              "endpoints": [], "subdomains": [], "repositories": [], "tools": [], "domain_info": [], "inputs": [], "encoded": [],
              "new_counts": {"subdomains": 0, "endpoints": 0, "services": 0}, "has_baseline": bool(previous_dir)}
     if not db_path:
@@ -276,16 +352,20 @@ def read_results(app: Flask, stored_dir: str | None, previous_dir: str | None = 
         if not run:
             db.close(); return empty
         run_id = run["id"]
+        available_tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         tables = {"Assets": "assets", "DNS": "dns_records", "Ports": "ports", "Web services": "http_services",
                   "Endpoints": "endpoints", "Findings": "findings", "Repositories": "repositories", "Inputs": "input_points", "Encoded values": "encoded_artifacts"}
+        if "technologies" in available_tables:tables["Technologies"]="technologies"
         data = dict(empty)
         data["counts"] = {label: db.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,)).fetchone()[0]
                           for label, table in tables.items()}
         port_columns={row[1] for row in db.execute("PRAGMA table_info(ports)")}
         port_fields=[field if field in port_columns else f"NULL AS {field}" for field in ("hostname","ip","port","protocol","service","state","reason","product","version","extra_info","cpe","scripts","source")]
+        asset_columns={row[1] for row in db.execute("PRAGMA table_info(assets)")}
+        asset_fields=[field if field in asset_columns else f"NULL AS {field}" for field in ("hostname","source","resolved","http_active","active_url","http_status","first_seen")]
         queries = {
             "services": "SELECT url,host,status,title,server,technologies,content_type,ip FROM http_services WHERE run_id=? ORDER BY host,status,url LIMIT 1000",
-            "subdomains": "SELECT hostname,source,resolved,first_seen FROM assets WHERE run_id=? ORDER BY hostname LIMIT 2000",
+            "subdomains": f"SELECT {','.join(asset_fields)} FROM assets WHERE run_id=? ORDER BY hostname LIMIT 5000",
             "ports": f"SELECT {','.join(port_fields)} FROM ports WHERE run_id=? ORDER BY ip,port,hostname LIMIT 5000",
             "dns": "SELECT hostname,type,value,source FROM dns_records WHERE run_id=? ORDER BY hostname,type LIMIT 500",
             "findings": "SELECT severity,name,template_id,matched_at,host,tool AS source FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END LIMIT 500",
@@ -296,14 +376,17 @@ def read_results(app: Flask, stored_dir: str | None, previous_dir: str | None = 
             "inputs": "SELECT page_url,action_url,method,name,input_type,tested,reflection_context FROM input_points WHERE run_id=? ORDER BY page_url,name LIMIT 500",
             "encoded": "SELECT source_url,location,kind,value_preview,decoded_preview,is_hash,analyzer FROM encoded_artifacts WHERE run_id=? ORDER BY source_url,location LIMIT 500",
         }
+        if "technologies" in available_tables:
+            queries["technologies"]="SELECT host,url,name,version,category,source,confidence,evidence FROM technologies WHERE run_id=? ORDER BY host,category,name,version LIMIT 2000"
         for name, query in queries.items():
             rows = [dict(row) for row in db.execute(query, (run_id,)).fetchall()]
             for row in rows:
                 for key in ("url", "matched_at"):
                     if row.get(key): row[key] = redact_url(str(row[key]))
             data[name] = rows
-        data["tech_stacks"],data["technology_summary"],data["technology_metrics"]=build_technology_inventory(data["services"],data["findings"])
+        data["tech_stacks"],data["technology_summary"],data["technology_metrics"]=build_technology_inventory(data["services"],data["findings"],data["technologies"])
         data["ip_inventory"],data["ip_metrics"]=build_ip_inventory(data["ports"],data["dns"])
+        data["active_subdomains"]=sum(bool(row.get("http_active")) for row in data["subdomains"])
         previous = result_inventory(app, previous_dir)
         for collection, key in (("subdomains", "hostname"), ("endpoints", "url"), ("services", "url")):
             for row in data[collection]:
@@ -322,6 +405,7 @@ REPORT_SECTIONS = (
     ("DNS records", "dns_records", "hostname,type,value,source", "hostname,type,value"),
     ("Open ports", "ports", "hostname,ip,port,protocol,service,source", "hostname,port"),
     ("Web services", "http_services", "url,host,status,title,server,technologies,content_type,content_length,ip,final_url", "host,url"),
+    ("Technology versions", "technologies", "host,url,name,version,category,source,confidence,evidence", "host,category,name,version"),
     ("Scanner observations", "findings", "severity,name,template_id,matched_at,host,tool,evidence", "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,name"),
     ("Discovered endpoints", "endpoints", "url,host,path,query_keys,extension,source,first_seen", "host,path,url"),
     ("Input surface", "input_points", "page_url,action_url,method,name,input_type,tested,reflection_context", "page_url,name"),
@@ -368,7 +452,10 @@ def build_markdown_report(app: Flask, stored_dir: str | None, scan: sqlite3.Row,
             db.close()
             return None
         collected = []
+        available_tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for title, table, columns, order in REPORT_SECTIONS:
+            if table not in available_tables:
+                continue
             rows = db.execute(f"SELECT {columns} FROM {table} WHERE run_id=? ORDER BY {order}", (run["id"],)).fetchall()
             collected.append((title, rows))
         db.close()
@@ -419,10 +506,21 @@ class ScanWorker:
 
     def command(self, row: sqlite3.Row, output: Path) -> list[str]:
         cfg = self.app.config
-        return [sys.executable, str(BASE_DIR / "recon_pipeline.py"), row["domain"],
+        command = [sys.executable, str(BASE_DIR / "recon_pipeline.py"), row["domain"],
                 "--i-have-authorization", "--profile", row["profile"], "--output", str(output),
                 "--rate", str(row["effective_rate"] or cfg["SCAN_RATE"]), "--concurrency", str(cfg["SCAN_CONCURRENCY"]),
                 "--active-delay", str(cfg["SCAN_ACTIVE_DELAY"])]
+        if row["skip_stages"]:
+            command += ["--skip-stages", row["skip_stages"]]
+        if row["scope_subdomains"]:
+            scope_file = output / "scope-subdomains.txt"
+            scope_file.parent.mkdir(parents=True, exist_ok=True)
+            scope_file.write_text(str(row["scope_subdomains"]), encoding="utf-8")
+            command += ["--scope-subdomains-file", str(scope_file)]
+        user_agent_file = BASE_DIR / "user-agent.txt"
+        if user_agent_file.is_file():
+            command += ["--user-agent-file", str(user_agent_file)]
+        return command
 
     def execute(self, row: sqlite3.Row) -> None:
         output = Path(self.app.config["RESULTS_DIR"]) / f"target-{row['target_id']}" / f"scan-{row['id']}"
@@ -500,7 +598,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             head = "".join(f"<th>{escape(labels.get(key, key.replace('_',' ').title()))}</th>" for key in keys)
             body = "".join("<tr>" + "".join(f"<td>{escape('—' if row.get(key) is None else row.get(key))}</td>" for key in keys) + "</tr>" for row in rows)
             return Markup(f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>')
-        return {"csrf_token": session.get("csrf_token", ""), "default_profile": app.config["DEFAULT_SCAN_PROFILE"], "table": table}
+        return {"csrf_token": session.get("csrf_token", ""), "default_profile": app.config["DEFAULT_SCAN_PROFILE"], "scan_stage_choices": SCAN_STAGE_CHOICES, "table": table}
 
     @app.route("/login", methods=["GET", "POST"])
     def login() -> Any:
@@ -634,11 +732,16 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
         queued = 0
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
             for domain in domains:
+                try:
+                    skip_stages, scope_subdomains = selected_scan_options(request.form, domain)
+                except ValueError as exc:
+                    flash(str(exc), "error")
+                    continue
                 db.execute("INSERT OR IGNORE INTO targets(domain,request_rate) VALUES(?,?)", (domain, request_rate))
                 target_id = db.execute("SELECT id FROM targets WHERE domain=?", (domain,)).fetchone()["id"]
                 active = db.execute("SELECT 1 FROM scans WHERE target_id=? AND status IN ('queued','running')", (target_id,)).fetchone()
                 if not active:
-                    db.execute("INSERT INTO scans(target_id,profile,request_rate,status) VALUES(?,?,?,'queued')", (target_id, profile, request_rate)); queued += 1
+                    db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains)); queued += 1
         if queued: flash(f"Queued {queued} authorized target scan(s).", "success")
         if invalid: flash(f"Skipped {len(invalid)} invalid target(s).", "error")
         if not queued and not invalid: flash("No new scans were queued; these targets may already be active.", "info")
@@ -706,12 +809,18 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
         if not 1 <= request_rate <= 500:
             abort(400, "Request rate must be between 1 and 500")
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            if not db.execute("SELECT 1 FROM targets WHERE id=?", (target_id,)).fetchone(): abort(404)
+            target = db.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+            if not target: abort(404)
+            try:
+                skip_stages, scope_subdomains = selected_scan_options(request.form, str(target["domain"]))
+            except ValueError as exc:
+                flash(str(exc), "error")
+                return redirect(url_for("target_detail", target_id=target_id))
             active = db.execute("SELECT 1 FROM scans WHERE target_id=? AND status IN ('queued','running')", (target_id,)).fetchone()
             if active: flash("This target already has an active scan.", "info")
             else:
                 db.execute("UPDATE targets SET request_rate=? WHERE id=?", (request_rate, target_id))
-                db.execute("INSERT INTO scans(target_id,profile,request_rate,status) VALUES(?,?,?,'queued')", (target_id, profile, request_rate))
+                db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains))
                 flash(f"Scan queued at {request_rate} requests per second.", "success")
         return redirect(url_for("target_detail", target_id=target_id))
 
@@ -743,10 +852,11 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def scan_status(scan_id: int) -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            scan = db.execute("SELECT id,target_id,status,profile,started_at,finished_at,log_path,error,exit_code FROM scans WHERE id=?", (scan_id,)).fetchone()
+            scan = db.execute("SELECT id,target_id,status,profile,started_at,finished_at,result_dir,log_path,error,exit_code FROM scans WHERE id=?", (scan_id,)).fetchone()
         if not scan: abort(404)
         payload = dict(scan); log_path = payload.pop("log_path", None)
         payload["log"] = tail_text(Path(log_path)) if log_path else ""
+        payload["progress"] = progress_summary(app, scan)
         return jsonify(payload)
 
     @app.get("/api/events")
@@ -766,11 +876,12 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
                       FROM scans s WHERE s.id=(SELECT id FROM scans WHERE target_id=s.target_id ORDER BY id DESC LIMIT 1) ORDER BY s.id DESC""")]
                     tracked = None
                     if tracked_scan:
-                        row = db.execute("SELECT id,target_id,status,profile,request_rate,started_at,finished_at,log_path,error,exit_code FROM scans WHERE id=?", (tracked_scan,)).fetchone()
+                        row = db.execute("SELECT id,target_id,status,profile,request_rate,started_at,finished_at,result_dir,log_path,error,exit_code FROM scans WHERE id=?", (tracked_scan,)).fetchone()
                         if row:
                             tracked = dict(row)
                             log_path = tracked.pop("log_path", None)
                             tracked["log"] = tail_text(Path(log_path)) if log_path else ""
+                            tracked["progress"] = progress_summary(app, row)
                 payload = json.dumps({"totals": totals, "latest": latest, "tracked": tracked}, sort_keys=True, separators=(",", ":"))
                 if payload != previous:
                     yield f"event: workspace\ndata: {payload}\n\n"

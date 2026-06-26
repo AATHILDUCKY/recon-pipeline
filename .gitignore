@@ -1,6 +1,7 @@
 .env
 .venv/
 venv/
+.pip-cache/
 instance/
 results/
 tools/

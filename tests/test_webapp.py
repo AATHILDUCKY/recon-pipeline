@@ -124,6 +124,19 @@ class WebApplicationTests(unittest.TestCase):
         self.login();response=self.client.get(f"/targets/{target_id}#infrastructure")
         self.assertIn(b"192.0.2.10",response.data);self.assertIn(b"nginx",response.data);self.assertIn(b"ssl-cert",response.data)
 
+    def test_httpx_active_subdomain_state_is_highlighted(self):
+        result=Path(self.app.config["RESULTS_DIR"])/"active-run";result.mkdir(parents=True)
+        database=Database(result/"recon.sqlite3");run=database.start("example.com","deep",{})
+        database.execute("INSERT INTO assets(run_id,hostname,source,resolved,http_active,active_url,http_status,first_seen) VALUES(?,?,?,?,?,?,?,?)",(run,"api.example.com","httpx-recursive",1,1,"https://api.example.com/",200,"2026-01-01T00:00:00Z"))
+        database.execute("INSERT INTO assets(run_id,hostname,source,resolved,http_active,first_seen) VALUES(?,?,?,?,?,?)",(run,"old.example.com","archive",1,0,"2026-01-01T00:00:00Z"))
+        database.finish(run,"complete");database.conn.close()
+        data=read_results(self.app,str(result));self.assertEqual(data["active_subdomains"],1)
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            target_id=control.execute("INSERT INTO targets(domain) VALUES(?)",("example.com",)).lastrowid
+            control.execute("INSERT INTO scans(target_id,profile,status,result_dir) VALUES(?,?,'complete',?)",(target_id,"deep",str(result)))
+        self.login();response=self.client.get(f"/targets/{target_id}#subdomains")
+        self.assertIn(b"active-badge",response.data);self.assertIn(b"HTTP 200",response.data);self.assertIn(b"https://api.example.com/",response.data)
+
     def test_markdown_report_download_contains_all_recon_sections(self):
         result = Path(self.tmp.name) / "results" / "example-run"
         result.mkdir(parents=True)

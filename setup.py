@@ -114,8 +114,8 @@ def clone_tools(dry_run: bool) -> None:
             print(f"= {name}: already present")
             continue
         binary = SOURCE_BINARIES.get(name)
-        if binary and binary_available(binary):
-            print(f"= {name}: source not needed; {binary} is already available")
+        if binary and skip_available_binary(binary):
+            print(f"= {name}: source checkout not needed")
             continue
         run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(destination)], dry_run=dry_run)
         run(["git", "checkout", revision], cwd=destination, dry_run=dry_run)
@@ -403,16 +403,35 @@ def install_python(dry_run: bool, force: bool) -> None:
         mark_environment(environment, wanted, dry_run)
 
 
-def binary_available(name: str) -> bool:
-    return local_binary(name) is not None or shutil.which(name) is not None
-
-
 def local_binary(name: str) -> Path | None:
     for folder in LOCAL_BIN_DIRS:
         local = folder / name
         if local.is_file() and os.access(local, os.X_OK):
             return local
     return None
+
+
+def system_binary(name: str) -> Path | None:
+    found = shutil.which(name)
+    return Path(found) if found else None
+
+
+def binary_location(name: str) -> Path | None:
+    return local_binary(name) or system_binary(name)
+
+
+def binary_available(name: str) -> bool:
+    return binary_location(name) is not None
+
+
+def skip_available_binary(name: str, *, force: bool = False) -> bool:
+    if force:
+        return False
+    location = binary_location(name)
+    if not location:
+        return False
+    print(f"= {name}: already available at {location}")
+    return True
 
 
 def ensure_legacy_go_module(source: Path, module: str, requirements: tuple[str, ...], dry_run: bool) -> None:
@@ -449,8 +468,7 @@ def install_go(dry_run: bool, force: bool) -> None:
     env = os.environ.copy()
     env["GOBIN"] = str(BIN)
     for name, module in GO_TOOLS.items():
-        if not force and binary_available(name):
-            print(f"= {name}: already available")
+        if skip_available_binary(name, force=force):
             continue
         if not go_available:
             print(f"! Go is unavailable; skipping {name}")
@@ -458,8 +476,7 @@ def install_go(dry_run: bool, force: bool) -> None:
         BIN.mkdir(parents=True, exist_ok=True)
         run(["go", "install", module], env=env, dry_run=dry_run)
     for name, source in (("gitleaks", "gitleaks"), ("mantra", "mantra"), ("subover", "SubOver")):
-        if not force and binary_available(name):
-            print(f"= {name}: already available")
+        if skip_available_binary(name, force=force):
             continue
         if not go_available:
             print(f"! Go is unavailable; skipping {name}")
@@ -468,8 +485,7 @@ def install_go(dry_run: bool, force: bool) -> None:
 
 
 def install_trufflehog(dry_run: bool, force: bool) -> None:
-    if not force and binary_available("trufflehog"):
-        print("= trufflehog: already available")
+    if skip_available_binary("trufflehog", force=force):
         return
     if not shutil.which("curl"):
         print("! curl is unavailable; skipping trufflehog installer")

@@ -31,6 +31,7 @@ import urllib.request
 import urllib.error
 import ssl
 import xml.etree.ElementTree as ET
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -85,6 +86,31 @@ def canonical_domain(value: str) -> str:
 def in_scope_host(host: str, domain: str) -> bool:
     host = host.lower().rstrip(".")
     return host == domain or host.endswith("." + domain)
+
+
+def scope_entry_host(value: str) -> str:
+    value = value.strip().lower().rstrip(".")
+    if "://" in value:
+        return (urllib.parse.urlsplit(value).hostname or "").lower().rstrip(".")
+    return value.split("/", 1)[0].rstrip(".")
+
+
+def scope_entry_matches(host: str, entry: str) -> bool:
+    host, entry = host.lower().rstrip("."), entry.lower().rstrip(".")
+    if entry.startswith("*."):
+        suffix = entry[2:]
+        return host.endswith("." + suffix) and host != suffix
+    if "*" in entry:
+        return fnmatchcase(host, entry)
+    return host == entry
+
+
+def host_in_scope_entries(host: str, domain: str, entries: Iterable[str]) -> bool:
+    host = host.lower().rstrip(".")
+    if not in_scope_host(host, domain):
+        return False
+    entries = tuple(entry for entry in entries if entry)
+    return any(scope_entry_matches(host, entry) for entry in entries) if entries else True
 
 
 def canonical_url(value: str, domain: str) -> str | None:
@@ -311,13 +337,17 @@ STAGE_ALIASES = {
 
 
 def canonical_scope_subdomain(value: str, domain: str) -> str:
-    value=value.strip().lower().rstrip(".")
+    value=scope_entry_host(value)
     if not value:return ""
-    if "://" in value:
-        host=urllib.parse.urlsplit(value).hostname or ""
-        value=host.lower().rstrip(".")
-    if not in_scope_host(value,domain) or not DOMAIN_RE.fullmatch(value):
+    validation_host=value.replace("*","a")
+    if not in_scope_host(validation_host,domain) or not DOMAIN_RE.fullmatch(validation_host):
         raise ValueError(f"subdomain is outside scope or invalid: {value!r}")
+    if "*" in value:
+        labels=value.split(".")
+        if any("*" in label for label in labels[1:]):
+            raise ValueError(f"wildcards are only supported in the left-most label: {value!r}")
+        if labels[0] == "*":
+            value = "*." + ".".join(labels[1:])
     return value
 
 
@@ -456,6 +486,27 @@ class Pipeline:
     def user_agent(self, purpose: str = "authorized-security-review") -> str:
         return self.user_agents.choose(purpose)
 
+    def host_allowed(self, host: str) -> bool:
+        return host_in_scope_entries(host, self.cfg.domain, self.cfg.scope_subdomains)
+
+    def scope_search_domains(self) -> list[str]:
+        if not self.cfg.scope_subdomains:
+            return [self.cfg.domain]
+        domains: set[str] = set()
+        for entry in self.cfg.scope_subdomains:
+            if entry.startswith("*."):
+                domains.add(entry[2:])
+            elif "*" in entry:
+                parts = entry.split(".")
+                star_index = next((idx for idx, part in enumerate(parts) if "*" in part), 0)
+                suffix = ".".join(parts[star_index + 1:])
+                if suffix and in_scope_host(suffix, self.cfg.domain):
+                    domains.add(suffix)
+        return sorted(domains or {self.cfg.domain})
+
+    def scope_has_discovery_patterns(self) -> bool:
+        return any("*" in entry for entry in self.cfg.scope_subdomains)
+
     def log(self, message: str, color: str = "cyan") -> None:
         use = sys.stderr.isatty() and not os.getenv("NO_COLOR")
         eta=""
@@ -504,9 +555,9 @@ class Pipeline:
         return path
 
     def seed_scope_assets(self) -> None:
-        seeds={self.cfg.domain,*self.cfg.scope_subdomains}
+        seeds={self.cfg.domain,*[entry for entry in self.cfg.scope_subdomains if "*" not in entry]}
         for host in sorted(seeds):
-            if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host):
+            if self.host_allowed(host) and DOMAIN_RE.fullmatch(host):
                 self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"scope-input" if host!=self.cfg.domain else "apex",utcnow()))
         self.db.conn.commit()
 
@@ -597,7 +648,7 @@ class Pipeline:
             try:
                 for row in recon.execute("SELECT host,ip_address,module FROM hosts"):
                     host=str(row["host"] or "").lower().lstrip("*.").rstrip(".")
-                    if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host):
+                    if self.host_allowed(host) and DOMAIN_RE.fullmatch(host):
                         self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"recon-ng:"+str(row["module"] or "unknown"),utcnow()))
                         if row["ip_address"]:self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,"A",str(row["ip_address"]),"recon-ng"))
             finally:recon.close()
@@ -615,7 +666,9 @@ class Pipeline:
                 if not path.exists():continue
                 text=path.read_text(errors="replace")
                 for host in set(re.findall(rf"(?i)\b(?:[a-z0-9-]+\.)+{re.escape(self.cfg.domain)}\b",text)):
-                    self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host.lower(),"theHarvester",utcnow()))
+                    host=host.lower()
+                    if self.host_allowed(host):
+                        self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"theHarvester",utcnow()))
                 for email in set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",text)):
                     self.db.execute("INSERT OR IGNORE INTO domain_info(run_id,key,value,source) VALUES(?,?,?,?)",(self.run_id,"Public email",email,"theHarvester"))
         spider=base/"tools/spiderfoot/sf.py";spython=base/"tools/spiderfoot/.venv/bin/python"
@@ -625,7 +678,9 @@ class Pipeline:
             if code==0:
                 text=out.read_text(errors="replace")
                 for host in set(re.findall(rf"(?i)\b(?:[a-z0-9-]+\.)+{re.escape(self.cfg.domain)}\b",text)):
-                    self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host.lower(),"spiderfoot",utcnow()))
+                    host=host.lower()
+                    if self.host_allowed(host):
+                        self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"spiderfoot",utcnow()))
         self.db.conn.commit()
 
     async def dns_intelligence(self) -> None:
@@ -668,7 +723,7 @@ class Pipeline:
             if path.exists():
                 candidates.update(x.strip().lower() for x in path.read_text(errors="replace").splitlines())
         for host in candidates:
-            if in_scope_host(host, self.cfg.domain) and DOMAIN_RE.fullmatch(host):
+            if self.host_allowed(host) and DOMAIN_RE.fullmatch(host):
                 self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)", (self.run_id,host,"ducky-subs",utcnow()))
         self.db.conn.commit(); self.done += 1
 
@@ -678,7 +733,7 @@ class Pipeline:
         self.db.conn.commit(); self.done += 1
 
     async def resolve_host_batch(self, hosts: Iterable[str], artifact_name: str) -> set[str]:
-        values=sorted({host for host in hosts if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host)})
+        values=sorted({host for host in hosts if self.host_allowed(host) and DOMAIN_RE.fullmatch(host)})
         if not values:return set()
         inp=self.write_input(artifact_name+".txt",values)
         code, out = await self.run_tool("02-resolve", "dnsx", ["-l", str(inp), "-a", "-aaaa", "-cname", "-resp", "-json", "-silent", "-rl", str(self.cfg.rate), "-t", str(self.cfg.concurrency)],artifact_name=artifact_name)
@@ -686,7 +741,7 @@ class Pipeline:
         if code == 0:
             for row in json_lines(out):
                 host = str(row.get("host") or row.get("input") or "").lower()
-                if not in_scope_host(host,self.cfg.domain): continue
+                if not self.host_allowed(host): continue
                 values = row.get("a", []) + row.get("aaaa", []) + row.get("cname", [])
                 for value in values:
                     typ = "AAAA" if ":" in str(value) else ("A" if re.fullmatch(r"[\d.]+",str(value)) else "CNAME")
@@ -705,24 +760,28 @@ class Pipeline:
         with wordlist.open(errors="replace") as handle:
             word_count=sum(1 for line in handle if line.strip() and not line.lstrip().startswith("#"))
         stage_timeout=max(1800,math.ceil(word_count/max(1,self.cfg.rate))*2+self.cfg.timeout*2)
-        args=["dns","--domain",self.cfg.domain,"--wordlist",str(wordlist),"--check-cname","--threads",str(workers),"--delay",f"{delay_ms}ms","--timeout",f"{self.cfg.timeout}s","--quiet","--no-progress","--no-color"]
-        _,out=await self.run_tool("01-active-dns","gobuster",args,timeout=stage_timeout)
-        for raw in out.read_text(errors="replace").splitlines() if out.exists() else []:
-            line=re.sub(r"\x1b\[[0-9;]*m","",raw).strip()
-            if not line:continue
-            host=line.split(None,1)[0].lower().rstrip(".")
-            if not in_scope_host(host,self.cfg.domain) or not DOMAIN_RE.fullmatch(host):continue
-            self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,resolved,first_seen) VALUES(?,?,?,?,?)",(self.run_id,host,"gobuster-dns",1,utcnow()))
-            remainder=line[len(line.split(None,1)[0]):].strip();cname=""
-            if " CNAME: " in " "+remainder:
-                remainder,cname=(" "+remainder).split(" CNAME: ",1);remainder=remainder.strip()
-            for candidate in remainder.replace(","," ").split():
-                try:ipaddress.ip_address(candidate)
-                except ValueError:continue
-                typ="AAAA" if ":" in candidate else "A"
-                self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,typ,candidate,"gobuster-dns"))
-            if cname:
-                self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,"CNAME",cname.rstrip("."),"gobuster-dns"))
+        search_domains=self.scope_search_domains()
+        if self.cfg.scope_subdomains and not self.scope_has_discovery_patterns():
+            self.log("01-active-dns: exact scoped hosts supplied; wildcard DNS enumeration skipped","yellow");self.done+=1;return
+        for search_domain in search_domains:
+            args=["dns","--domain",search_domain,"--wordlist",str(wordlist),"--check-cname","--threads",str(workers),"--delay",f"{delay_ms}ms","--timeout",f"{self.cfg.timeout}s","--quiet","--no-progress","--no-color"]
+            _,out=await self.run_tool("01-active-dns","gobuster",args,timeout=stage_timeout,artifact_name=f"gobuster-dns-{search_domain}")
+            for raw in out.read_text(errors="replace").splitlines() if out.exists() else []:
+                line=re.sub(r"\x1b\[[0-9;]*m","",raw).strip()
+                if not line:continue
+                host=line.split(None,1)[0].lower().rstrip(".")
+                if not self.host_allowed(host) or not DOMAIN_RE.fullmatch(host):continue
+                self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,resolved,first_seen) VALUES(?,?,?,?,?)",(self.run_id,host,"gobuster-dns",1,utcnow()))
+                remainder=line[len(line.split(None,1)[0]):].strip();cname=""
+                if " CNAME: " in " "+remainder:
+                    remainder,cname=(" "+remainder).split(" CNAME: ",1);remainder=remainder.strip()
+                for candidate in remainder.replace(","," ").split():
+                    try:ipaddress.ip_address(candidate)
+                    except ValueError:continue
+                    typ="AAAA" if ":" in candidate else "A"
+                    self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,typ,candidate,"gobuster-dns"))
+                if cname:
+                    self.db.execute("INSERT OR IGNORE INTO dns_records(run_id,hostname,type,value,source) VALUES(?,?,?,?,?)",(self.run_id,host,"CNAME",cname.rstrip("."),"gobuster-dns"))
         self.db.conn.commit();self.done+=1
 
     async def archive_discovery(self) -> None:
@@ -734,11 +793,14 @@ class Pipeline:
             for line in out.read_text(errors="replace").splitlines():
                 url=canonical_url(line.strip(),self.cfg.domain)
                 if not url:continue
+                parsed=urllib.parse.urlsplit(url)
+                if not parsed.hostname or not self.host_allowed(parsed.hostname):continue
                 discovered.append(url)
-                host=urllib.parse.urlsplit(url).hostname
+                host=parsed.hostname
                 if host:hosts.add(host)
         for host in sorted(hosts):
-            self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"waybackurls",utcnow()))
+            if self.host_allowed(host):
+                self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"waybackurls",utcnow()))
         def priority(url: str) -> tuple[int,str]:
             parsed=urllib.parse.urlsplit(url);ext=Path(parsed.path).suffix.lower()
             return (0 if ext in {".js",".mjs",".map",".json"} else (1 if parsed.query else 2),url)
@@ -759,7 +821,7 @@ class Pipeline:
             host=str(item.get("subdomain") or item.get("domain") or item.get("host") or "").lower().rstrip(".")
             text=json.dumps(item,sort_keys=True);low=text.lower()
             positive=item.get("vulnerable") is True or (item.get("vulnerable") is not False and "not vulnerable" not in low and any(x in low for x in signals))
-            if host in hosts and in_scope_host(host,self.cfg.domain) and positive:
+            if host in hosts and self.host_allowed(host) and positive:
                 service=str(item.get("service") or item.get("type") or "unknown service")
                 self.add_tool_finding("subjack","high",f"Potential subdomain takeover: {service}",f"https://{host}/",text)
 
@@ -784,7 +846,7 @@ class Pipeline:
             for row in json_lines(out):
                 info=row.get("info",{}) or {};matched=str(row.get("matched-at") or row.get("host") or "")
                 host=urllib.parse.urlsplit(matched).hostname or matched.split(":")[0]
-                if in_scope_host(host,self.cfg.domain):self.add_tool_finding("nuclei-takeover",str(info.get("severity") or "high"),str(info.get("name") or "Potential subdomain takeover"),matched,json.dumps(row))
+                if self.host_allowed(host):self.add_tool_finding("nuclei-takeover",str(info.get("severity") or "high"),str(info.get("name") or "Potential subdomain takeover"),matched,json.dumps(row))
         self.db.conn.commit();self.done+=1
 
     async def ports(self) -> None:
@@ -826,7 +888,7 @@ class Pipeline:
             host_scripts={str(node.get("id") or ""):str(node.get("output") or "")[:4000] for node in host_node.findall("./hostscript/script") if node.get("id")}
             for ip in addresses:
                 mapped=set(self.db.values("SELECT hostname FROM dns_records WHERE run_id=? AND type IN ('A','AAAA') AND value=?",(self.run_id,ip)))
-                mapped.update(name for name in xml_names if in_scope_host(name,self.cfg.domain) and DOMAIN_RE.fullmatch(name))
+                mapped.update(name for name in xml_names if self.host_allowed(name) and DOMAIN_RE.fullmatch(name))
                 for port_node in host_node.findall("./ports/port"):
                     state_node=port_node.find("state");state=str(state_node.get("state") or "") if state_node is not None else ""
                     if state!="open":continue
@@ -896,7 +958,9 @@ class Pipeline:
         for row in json_lines(out):
             url=canonical_url(str(row.get("url") or row.get("input") or ""),self.cfg.domain)
             if not url:continue
-            p=urllib.parse.urlsplit(url);tech=row.get("tech",[]);tech=tech if isinstance(tech,list) else [tech]
+            p=urllib.parse.urlsplit(url)
+            if not p.hostname or not self.host_allowed(p.hostname):continue
+            tech=row.get("tech",[]);tech=tech if isinstance(tech,list) else [tech]
             for cpe in row.get("cpe",[]) if isinstance(row.get("cpe"),list) else []:
                 if cpe:tech.append(str(cpe))
             cdn_raw=row.get("cdn_name") or row.get("cdn") or "";cdn_name=str(cdn_raw).strip() if isinstance(cdn_raw,str) else "";cdn_type=str(row.get("cdn_type") or "").strip()
@@ -913,7 +977,7 @@ class Pipeline:
                 items=row.get(key,[]);items=items if isinstance(items,list) else [items]
                 for value in items:
                     host=str(value).lower().strip().rstrip(".")
-                    if in_scope_host(host,self.cfg.domain) and DOMAIN_RE.fullmatch(host):discovered.add(host)
+                    if self.host_allowed(host) and DOMAIN_RE.fullmatch(host):discovered.add(host)
         self.db.conn.commit();return discovered
 
     def add_endpoint(self, url: str, source: str) -> None:
@@ -921,12 +985,14 @@ class Pipeline:
         if current >= self.cfg.max_urls:return
         url=canonical_url(url,self.cfg.domain)
         if not url:return
-        p=urllib.parse.urlsplit(url); keys=sorted({k for k,_ in urllib.parse.parse_qsl(p.query,keep_blank_values=True)}); ext=Path(p.path).suffix.lower().lstrip(".")
+        p=urllib.parse.urlsplit(url)
+        if not p.hostname or not self.host_allowed(p.hostname):return
+        keys=sorted({k for k,_ in urllib.parse.parse_qsl(p.query,keep_blank_values=True)}); ext=Path(p.path).suffix.lower().lstrip(".")
         self.db.execute("INSERT OR IGNORE INTO endpoints(run_id,url,host,path,query_keys,extension,source,first_seen) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,url,p.hostname,p.path,json.dumps(keys),ext,source,utcnow()))
 
     def add_technology(self, host: str, url: str | None, name: str, version: str = "", source: str = "detector", confidence: str = "medium", evidence: str = "") -> None:
         host=str(host or "").lower().rstrip(".")
-        if not host or not in_scope_host(host,self.cfg.domain):
+        if not host or not self.host_allowed(host):
             return
         url=canonical_url(url,self.cfg.domain) if url else ""
         name, parsed_version = split_technology_label(name)
@@ -939,6 +1005,35 @@ class Pipeline:
           VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,host,url,name,version,source) DO UPDATE SET
           confidence=excluded.confidence,evidence=CASE WHEN excluded.evidence!='' THEN excluded.evidence ELSE technologies.evidence END""",
           (self.run_id,host,url,name,version,category,source,confidence,evidence[:1000],utcnow()))
+
+    def prune_scoped_inventory(self) -> None:
+        if not self.cfg.scope_subdomains:
+            return
+
+        def allowed_from_url(value: str) -> bool:
+            try:
+                host = urllib.parse.urlsplit(value).hostname or ""
+            except ValueError:
+                host = ""
+            return bool(host and self.host_allowed(host))
+
+        for table, column in (("assets","hostname"),("dns_records","hostname"),("ports","hostname"),("http_services","host"),("technologies","host")):
+            for row_id, host in self.db.conn.execute(f"SELECT id,{column} FROM {table} WHERE run_id=?", (self.run_id,)).fetchall():
+                if not self.host_allowed(str(host or "")):
+                    self.db.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+        for row_id, host in self.db.conn.execute("SELECT id,host FROM endpoints WHERE run_id=?", (self.run_id,)).fetchall():
+            if not self.host_allowed(str(host or "")):
+                self.db.execute("DELETE FROM endpoints WHERE id=?", (row_id,))
+        for table, column in (("input_points","page_url"),("encoded_artifacts","source_url")):
+            for row_id, value in self.db.conn.execute(f"SELECT id,{column} FROM {table} WHERE run_id=?", (self.run_id,)).fetchall():
+                if not allowed_from_url(str(value or "")):
+                    self.db.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+        for row_id, host, matched_at in self.db.conn.execute("SELECT id,host,matched_at FROM findings WHERE run_id=?", (self.run_id,)).fetchall():
+            host = str(host or "")
+            allowed = self.host_allowed(host) if host else allowed_from_url(str(matched_at or ""))
+            if not allowed:
+                self.db.execute("DELETE FROM findings WHERE id=?", (row_id,))
+        self.db.conn.commit()
 
     def sync_service_technologies(self, url: str) -> None:
         service=self.db.conn.execute("SELECT host,server,technologies FROM http_services WHERE run_id=? AND url=?",(self.run_id,url)).fetchone()
@@ -1586,7 +1681,7 @@ class Pipeline:
             for row in json_lines(out):
                 info=row.get("info",{}) or {}; matched=str(row.get("matched-at") or row.get("host") or "")
                 host=urllib.parse.urlsplit(matched).hostname or ""
-                if host and not in_scope_host(host,self.cfg.domain):continue
+                if host and not self.host_allowed(host):continue
                 self.db.execute("INSERT OR IGNORE INTO findings(run_id,tool,severity,template_id,name,matched_at,host,evidence) VALUES(?,?,?,?,?,?,?,?)",(self.run_id,tool_name,str(info.get("severity","unknown")),str(row.get("template-id") or ""),str(info.get("name") or ""),matched,host,json.dumps(row)))
         self.db.conn.commit();self.done+=1
 
@@ -1631,7 +1726,7 @@ class Pipeline:
                 steps += [("dns","02-resolve",self.resolve),("dns","02-dns",self.dns_intelligence)]
                 self.total=len(steps)
                 for stage_key,label,action in steps:await self.run_step(stage_key,label,action)
-                self.report(); status="complete"; self.log(f"complete: {self.root}","green"); return
+                self.prune_scoped_inventory();self.report(); status="complete"; self.log(f"complete: {self.root}","green"); return
             if self.cfg.profile=="deep":steps.append(("subdomain_enum","01-archive",self.archive_discovery))
             steps += [
                 ("subdomain_enum","01-active-dns",self.active_dns_enumeration),
@@ -1660,7 +1755,7 @@ class Pipeline:
                 ]
             self.total=len(steps)
             for stage_key,label,action in steps:await self.run_step(stage_key,label,action)
-            self.report(); status="complete"; self.log(f"complete: {self.root}","green")
+            self.prune_scoped_inventory();self.report(); status="complete"; self.log(f"complete: {self.root}","green")
         except (KeyboardInterrupt, asyncio.CancelledError):
             status="cancelled"; raise
         finally:

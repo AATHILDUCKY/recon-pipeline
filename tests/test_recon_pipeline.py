@@ -19,6 +19,21 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rp.canonical_url("https://A.Example.com:443/a//b?z=2&a=1#x", "example.com"), "https://a.example.com/a/b?a=1&z=2")
         self.assertIsNone(rp.canonical_url("https://evil.test/", "example.com"))
 
+    def test_scope_entries_accept_wildcards_prefixes_and_paths(self):
+        entries = tuple(rp.canonical_scope_subdomain(value, "infomaniak.com") for value in (
+            "*.kdrive.infomaniak.com",
+            "storage*.infomaniak.com",
+            "manager.infomaniak.com/v3/*",
+        ))
+        self.assertEqual(entries, ("*.kdrive.infomaniak.com", "storage*.infomaniak.com", "manager.infomaniak.com"))
+        self.assertTrue(rp.host_in_scope_entries("files.kdrive.infomaniak.com", "infomaniak.com", entries))
+        self.assertTrue(rp.host_in_scope_entries("storage12.infomaniak.com", "infomaniak.com", entries))
+        self.assertTrue(rp.host_in_scope_entries("manager.infomaniak.com", "infomaniak.com", entries))
+        self.assertFalse(rp.host_in_scope_entries("kdrive.infomaniak.com", "infomaniak.com", entries))
+        self.assertFalse(rp.host_in_scope_entries("mail.infomaniak.com", "infomaniak.com", entries))
+        with self.assertRaises(ValueError):
+            rp.canonical_scope_subdomain("*.evil.test", "infomaniak.com")
+
     def test_database_deduplicates(self):
         with TemporaryDirectory() as folder:
             db = rp.Database(Path(folder) / "x.db")
@@ -155,6 +170,25 @@ class PipelineTests(unittest.TestCase):
             rows=[tuple(row) for row in pipeline.db.conn.execute("SELECT hostname,resolved,http_active,http_status FROM assets ORDER BY hostname")]
             self.assertEqual(rows,[("a.example.com",1,1,200),("b.example.com",1,1,200)])
             self.assertEqual(pipeline.db.conn.execute("SELECT COUNT(*) FROM http_services").fetchone()[0],2)
+
+    def test_scoped_pipeline_keeps_only_matching_hosts_and_urls(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3,scope_subdomains=("*.app.example.com","api.example.com"))
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg)
+            self.assertTrue(pipeline.host_allowed("v1.app.example.com"))
+            self.assertFalse(pipeline.host_allowed("www.example.com"))
+            pipeline.db.execute("INSERT INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(pipeline.run_id,"api.example.com","test",rp.utcnow()))
+            pipeline.db.execute("INSERT INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(pipeline.run_id,"www.example.com","test",rp.utcnow()))
+            pipeline.add_endpoint("https://v1.app.example.com/health","test")
+            pipeline.add_endpoint("https://www.example.com/health","test")
+            pipeline.db.execute("INSERT INTO http_services(run_id,url,host,status) VALUES(?,?,?,?)",(pipeline.run_id,"https://www.example.com/","www.example.com",200))
+            pipeline.prune_scoped_inventory()
+            hosts=pipeline.db.values("SELECT hostname FROM assets WHERE run_id=? ORDER BY hostname",(pipeline.run_id,))
+            endpoints=pipeline.db.values("SELECT host FROM endpoints WHERE run_id=? ORDER BY host",(pipeline.run_id,))
+            services=pipeline.db.values("SELECT host FROM http_services WHERE run_id=?",(pipeline.run_id,))
+            self.assertEqual(hosts,["api.example.com"])
+            self.assertEqual(endpoints,["v1.app.example.com"])
+            self.assertEqual(services,[])
 
     def test_wayback_discovery_feeds_archived_hosts_and_prioritized_urls_into_deep_scan(self):
         cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,10,None,False,set(),100,100_000,10,0.5,3)

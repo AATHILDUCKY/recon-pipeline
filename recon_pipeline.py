@@ -507,6 +507,12 @@ class Pipeline:
     def scope_has_discovery_patterns(self) -> bool:
         return any("*" in entry for entry in self.cfg.scope_subdomains)
 
+    def exact_scope_hosts(self) -> set[str]:
+        return {entry for entry in self.cfg.scope_subdomains if "*" not in entry and DOMAIN_RE.fullmatch(entry)}
+
+    def should_preflight_active_scope(self) -> bool:
+        return bool(self.cfg.profile != "passive" and self.exact_scope_hosts() and not self.scope_has_discovery_patterns() and "http" not in self.cfg.skip_stages)
+
     def log(self, message: str, color: str = "cyan") -> None:
         use = sys.stderr.isatty() and not os.getenv("NO_COLOR")
         eta=""
@@ -560,6 +566,28 @@ class Pipeline:
             if self.host_allowed(host) and DOMAIN_RE.fullmatch(host):
                 self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"scope-input" if host!=self.cfg.domain else "apex",utcnow()))
         self.db.conn.commit()
+
+    async def preflight_active_scope(self) -> bool:
+        hosts=sorted(self.exact_scope_hosts())
+        if not hosts:
+            return True
+        before=time.monotonic()
+        self.log(f"00-scope-preflight: checking {len(hosts)} scoped host(s) for active HTTP service")
+        for host in hosts:
+            if self.host_allowed(host):
+                self.db.execute("INSERT OR IGNORE INTO assets(run_id,hostname,source,first_seen) VALUES(?,?,?,?)",(self.run_id,host,"scope-input",utcnow()))
+        resolved=await self.resolve_host_batch(hosts,"scope-preflight-dnsx")
+        await self.probe_http_batch(resolved,"scope-preflight-httpx")
+        active=set(self.db.values("SELECT hostname FROM assets WHERE run_id=? AND http_active=1",(self.run_id,))) & set(hosts)
+        inactive=sorted(set(hosts)-active)
+        for host in inactive:
+            self.db.execute("DELETE FROM dns_records WHERE run_id=? AND hostname=?",(self.run_id,host))
+            self.db.execute("DELETE FROM assets WHERE run_id=? AND hostname=? AND source='scope-input'",(self.run_id,host))
+        self.db.conn.commit()
+        message=f"{len(active)} active scoped host(s), {len(inactive)} inactive skipped"
+        self.log(f"00-scope-preflight: {message}","green" if active else "yellow")
+        self.record_stage("00-scope-preflight","ok" if active else "skipped",message,time.monotonic()-before)
+        return bool(active)
 
     def record_stage(self, stage: str, status: str, message: str, duration: float = 0.0) -> None:
         self.db.execute("INSERT INTO tool_runs(run_id,stage,tool,command_json,started_at,duration,exit_code,status,stdout_path,stderr_path) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.run_id,stage,"pipeline-stage",json.dumps({"message":message}),utcnow(),duration,None,status,"",""))
@@ -1716,6 +1744,8 @@ class Pipeline:
         status="failed"
         try:
             self.seed_scope_assets()
+            if self.should_preflight_active_scope() and not await self.preflight_active_scope():
+                self.prune_scoped_inventory();self.report();status="complete";self.log("complete: no active scoped hosts found; heavy scan stages skipped","yellow");return
             steps=[
                 ("dns","00-domain",self.domain_intelligence),
                 ("subdomain_enum","00-recon-ng",self.recon_ng),

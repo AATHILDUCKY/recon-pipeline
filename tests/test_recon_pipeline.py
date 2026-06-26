@@ -171,6 +171,28 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(rows,[("a.example.com",1,1,200),("b.example.com",1,1,200)])
             self.assertEqual(pipeline.db.conn.execute("SELECT COUNT(*) FROM http_services").fetchone()[0],2)
 
+    def test_exact_scope_preflight_keeps_only_active_http_hosts(self):
+        cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3,scope_subdomains=("active.example.com","dead.example.com"))
+        with TemporaryDirectory() as folder:
+            cfg.output=Path(folder);pipeline=rp.Pipeline(cfg);calls=[]
+            pipeline.seed_scope_assets()
+            async def fake_run_tool(stage, name, args, **kwargs):
+                artifact=kwargs.get("artifact_name",name);calls.append((stage,name,artifact,args));output=pipeline.raw/f"{artifact}.stdout"
+                if name=="dnsx":
+                    output.write_text("".join(json.dumps({"host":host,"a":[f"192.0.2.{idx}"],"aaaa":[],"cname":[]})+"\n" for idx,host in enumerate(("active.example.com","dead.example.com"),10)))
+                elif name=="httpx":
+                    output.write_text(json.dumps({"url":"https://active.example.com/","status_code":200,"title":"active"})+"\n")
+                else:
+                    output.write_text("")
+                return 0,output
+            pipeline.run_tool=fake_run_tool;pipeline.tool=lambda *names:"/fake/"+names[0]
+            active=asyncio.run(pipeline.preflight_active_scope())
+            self.assertTrue(active)
+            self.assertEqual([call[2] for call in calls],["scope-preflight-dnsx","scope-preflight-httpx"])
+            rows=[tuple(row) for row in pipeline.db.conn.execute("SELECT hostname,resolved,http_active FROM assets ORDER BY hostname")]
+            self.assertEqual(rows,[("active.example.com",1,1)])
+            self.assertEqual(pipeline.db.values("SELECT hostname FROM dns_records WHERE run_id=? ORDER BY hostname",(pipeline.run_id,)),["active.example.com"])
+
     def test_scoped_pipeline_keeps_only_matching_hosts_and_urls(self):
         cfg = rp.Config("example.com","deep",Path("."),20,10,10,2,100,None,False,set(),100,100_000,10,0.5,3,scope_subdomains=("*.app.example.com","api.example.com"))
         with TemporaryDirectory() as folder:

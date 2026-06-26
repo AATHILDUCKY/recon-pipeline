@@ -28,6 +28,7 @@ from recon_pipeline import canonical_domain, canonical_scope_subdomain, redact_u
 
 BASE_DIR = Path(__file__).resolve().parent
 ACTIVE_STATUSES = ("queued", "running")
+STATUS_PRIORITY = {"running": 0, "queued": 1, "failed": 2, "complete": 3, "cancelled": 4, "": 5}
 TARGET_WITH_LATEST_SQL = """SELECT t.*,p.name project_name,s.id scan_id,s.profile,s.status,s.created_at scan_created,
               s.started_at,s.finished_at,s.error FROM targets t LEFT JOIN projects p ON p.id=t.project_id
               LEFT JOIN scans s ON s.id=(SELECT id FROM scans WHERE target_id=t.id ORDER BY id DESC LIMIT 1)"""
@@ -137,6 +138,14 @@ def scope_only_targets(raw_scope: str) -> tuple[list[tuple[str, str]], list[str]
 def project_name(value: str, fallback: str = "Deep analysis") -> str:
     name = re.sub(r"\s+", " ", str(value or "").strip())
     return (name or fallback)[:120]
+
+
+def scan_activity_value(row: dict[str, Any]) -> str:
+    return str(row.get("finished_at") or row.get("started_at") or row.get("scan_created") or row.get("created_at") or "")
+
+
+def status_priority(status: Any) -> int:
+    return STATUS_PRIORITY.get(str(status or ""), STATUS_PRIORITY[""])
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -339,8 +348,9 @@ def project_summaries(db: sqlite3.Connection, project_id: int | None = None) -> 
     projects = [dict(row) for row in db.execute(f"SELECT p.* FROM projects p {where} ORDER BY p.id DESC", args)]
     for project in projects:
         targets = [dict(row) for row in db.execute(TARGET_WITH_LATEST_SQL + " WHERE t.project_id=? ORDER BY t.domain", (project["id"],))]
+        targets.sort(key=lambda row: (status_priority(row.get("status")), -int(row.get("scan_id") or 0), str(row.get("domain") or "").lower()))
         statuses = [row.get("status") for row in targets if row.get("status")]
-        latest_activity = max((row.get("finished_at") or row.get("started_at") or row.get("scan_created") or row.get("created_at") or "" for row in targets), default="")
+        latest_activity = max((scan_activity_value(row) for row in targets), default="")
         project.update({
             "targets": targets,
             "domain_count": len(targets),
@@ -349,6 +359,10 @@ def project_summaries(db: sqlite3.Connection, project_id: int | None = None) -> 
             "latest_activity": latest_activity,
             "status": "running" if "running" in statuses else ("queued" if "queued" in statuses else (statuses[0] if statuses else "")),
         })
+    projects.sort(key=lambda row: str(row.get("name") or "").lower())
+    projects.sort(key=lambda row: str(row.get("latest_activity") or row.get("created_at") or ""), reverse=True)
+    projects.sort(key=lambda row: -(row.get("active_count") or 0))
+    projects.sort(key=lambda row: status_priority(row.get("status")))
     return projects
 
 
@@ -1032,7 +1046,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             while True:
                 with connect_db(Path(app.config["CONTROL_DB"])) as db:
                     totals = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM scans GROUP BY status")}
-                    latest = [dict(row) for row in db.execute("""SELECT s.id,s.target_id,t.project_id,s.status,s.profile,s.request_rate,s.started_at,s.finished_at,s.error
+                    latest = [dict(row) for row in db.execute("""SELECT s.id,s.target_id,t.project_id,s.status,s.profile,s.request_rate,s.created_at,s.started_at,s.finished_at,s.error
                       FROM scans s JOIN targets t ON t.id=s.target_id WHERE s.id=(SELECT id FROM scans WHERE target_id=s.target_id ORDER BY id DESC LIMIT 1) ORDER BY s.id DESC""")]
                     tracked = None
                     if tracked_scan:

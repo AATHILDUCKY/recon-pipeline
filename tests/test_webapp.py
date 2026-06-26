@@ -77,6 +77,31 @@ class WebApplicationTests(unittest.TestCase):
         with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM scans WHERE status='queued'").fetchone()[0], 2)
 
+    def test_active_project_scope_rows_render_first(self):
+        self.login()
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
+            project_id = db.execute("INSERT INTO projects(name) VALUES(?)", ("Active sort",)).lastrowid
+            complete_id = db.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", ("complete.example.com", project_id)).lastrowid
+            running_id = db.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", ("running.example.com", project_id)).lastrowid
+            db.execute("INSERT INTO scans(target_id,profile,status,created_at,finished_at) VALUES(?,?,'complete','2026-01-01 10:00:00','2026-01-01 10:02:00')", (complete_id, "standard"))
+            db.execute("INSERT INTO scans(target_id,profile,status,created_at,started_at) VALUES(?,?,'running','2026-01-01 10:05:00','2026-01-01 10:06:00')", (running_id, "deep"))
+        body = self.client.get(f"/projects/{project_id}").get_data(as_text=True)
+        self.assertLess(body.index("running.example.com"), body.index("complete.example.com"))
+        self.assertIn('data-status="running"', body)
+
+    def test_project_search_metadata_includes_all_scope_items(self):
+        self.login()
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
+            project_id = db.execute("INSERT INTO projects(name) VALUES(?)", ("Metadata search",)).lastrowid
+            for domain in ("alpha.example.com", "beta.example.com", "charlie.example.com", "z-hidden.example.com"):
+                db.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", (domain, project_id))
+        body = self.client.get("/targets").get_data(as_text=True)
+        row_start = body.index('data-project-id="%s"' % project_id)
+        row_end = body.index("</a>", row_start)
+        project_row = body[row_start:row_end]
+        self.assertIn("z-hidden.example.com", project_row)
+        self.assertIn("+1 more", project_row)
+
     def test_authorization_confirmation_and_csrf_are_required(self):
         self.login()
         with self.client.session_transaction() as session: token = session["csrf_token"]

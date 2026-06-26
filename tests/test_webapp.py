@@ -13,7 +13,8 @@ class WebApplicationTests(unittest.TestCase):
         root = Path(self.tmp.name)
         self.app = create_app({"TESTING": True, "SECRET_KEY": "test-secret", "ADMIN_USERNAME": "admin",
                                "ADMIN_PASSWORD": "correct-password", "CONTROL_DB": str(root / "control.sqlite3"),
-                               "LOG_DIR": str(root / "logs"), "RESULTS_DIR": str(root / "results")}, start_worker=False)
+                               "LOG_DIR": str(root / "logs"), "RESULTS_DIR": str(root / "results"),
+                               "SCOPE_UPLOAD_DIR": str(root / "scope-uploads")}, start_worker=False)
         self.client = self.app.test_client()
 
     def tearDown(self): self.tmp.cleanup()
@@ -41,10 +42,39 @@ class WebApplicationTests(unittest.TestCase):
         self.login()
         with self.client.session_transaction() as session: token = session["csrf_token"]
         response = self.client.post("/targets", data={"csrf_token": token, "targets": "https://Example.com/a\nexample.com api.example.org",
-                                                       "profile": "standard", "authorized": "yes"})
+                                                       "project_name": "ACME deep analysis", "profile": "standard", "authorized": "yes"})
         self.assertEqual(response.status_code, 302)
         with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM targets").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM scans WHERE status='queued'").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM projects WHERE name='ACME deep analysis'").fetchone()[0], 1)
+
+    def test_scope_only_hosts_are_queued_as_independent_scans(self):
+        self.login()
+        with self.client.session_transaction() as session: token = session["csrf_token"]
+        response = self.client.post("/targets", data={"csrf_token": token, "targets": "",
+                                                       "scope_subdomains": "api.example.com\ncdn.example.com",
+                                                       "profile": "standard", "authorized": "yes"})
+        self.assertEqual(response.status_code, 302)
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
+            domains = [row[0] for row in db.execute("SELECT domain FROM targets ORDER BY domain")]
+            scopes = [row[0] for row in db.execute("SELECT scope_subdomains FROM scans ORDER BY scope_subdomains")]
+            self.assertEqual(domains, ["api.example.com", "cdn.example.com"])
+            self.assertEqual(scopes, ["api.example.com", "cdn.example.com"])
+
+    def test_large_scope_list_can_be_uploaded_in_chunks_before_queueing(self):
+        self.login()
+        with self.client.session_transaction() as session: token = session["csrf_token"]
+        first = self.client.post("/api/scope-upload", data={"csrf_token": token, "chunk": "api.example.com\n"})
+        self.assertEqual(first.status_code, 200)
+        upload_id = first.get_json()["upload_id"]
+        second = self.client.post("/api/scope-upload", data={"csrf_token": token, "upload_id": upload_id, "chunk": "cdn.example.com\n"})
+        self.assertEqual(second.status_code, 200)
+        response = self.client.post("/targets", data={"csrf_token": token, "targets": "", "scope_upload_id": upload_id,
+                                                       "profile": "passive", "authorized": "yes"})
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse((Path(self.app.config["SCOPE_UPLOAD_DIR"]) / f"{upload_id}.txt").exists())
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM scans WHERE status='queued'").fetchone()[0], 2)
 
     def test_authorization_confirmation_and_csrf_are_required(self):
@@ -198,6 +228,19 @@ class WebApplicationTests(unittest.TestCase):
             self.assertEqual(scan, ("deep", 8))
             self.assertEqual(control.execute("SELECT request_rate FROM targets WHERE id=?", (target_id,)).fetchone()[0], 8)
 
+    def test_rescan_accepts_uploaded_scope_list(self):
+        self.login()
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            target_id = control.execute("INSERT INTO targets(domain,request_rate) VALUES(?,?)", ("example.com", 30)).lastrowid
+        with self.client.session_transaction() as session: token = session["csrf_token"]
+        upload = self.client.post("/api/scope-upload", data={"csrf_token": token, "chunk": "api.example.com\n"})
+        upload_id = upload.get_json()["upload_id"]
+        response = self.client.post(f"/targets/{target_id}/scan", data={"csrf_token": token, "authorized": "yes",
+                                    "profile": "standard", "request_rate": "10", "scope_upload_id": upload_id})
+        self.assertEqual(response.status_code, 302)
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            self.assertEqual(control.execute("SELECT scope_subdomains FROM scans WHERE target_id=?", (target_id,)).fetchone()[0], "api.example.com")
+
     def test_completed_scan_delete_removes_record_and_scoped_artifacts(self):
         result = Path(self.app.config["RESULTS_DIR"]) / "target-1" / "scan-1" / "run"
         log = Path(self.app.config["LOG_DIR"]) / "scan-1.log"
@@ -261,8 +304,8 @@ class WebApplicationTests(unittest.TestCase):
             scan_id = control.execute("""INSERT INTO scans(target_id,profile,status,finished_at,result_dir,exit_code)
                                       VALUES(?,?,'complete',CURRENT_TIMESTAMP,?,0)""", (target_id, "standard", str(result))).lastrowid
         self.login()
-        for path, marker in (("/targets", b"Managed websites"), ("/scans", b"All scan runs"),
-                             ("/attack-surface", b"Coverage by website"), ("/reports", b"Report library"),
+        for path, marker in (("/targets", b"Managed projects"), ("/scans", b"All scan runs"),
+                             ("/attack-surface", b"Coverage by project scope"), ("/reports", b"Report library"),
                              (f"/reports/{scan_id}", b"api.example.com")):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200, path)

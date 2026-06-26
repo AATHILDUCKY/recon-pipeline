@@ -40,7 +40,7 @@ Results are written to `results/<domain>-<timestamp>/` with `report.html`, `reco
 
 ## Web application
 
-The included web console adds authenticated target management, persistent scan queues, live log progress, and result pages backed by each scan's SQLite database.
+The included web console adds authenticated project management, persistent scan queues, live log progress, and result pages backed by each scan's SQLite database. A project is a named organization or assessment, such as `ACME deep analysis`, and can contain many authorized domains or exact hosts.
 
 1. Edit `.env` and replace `ADMIN_PASSWORD` and `FLASK_SECRET_KEY`. Keep `WEB_HOST=127.0.0.1` unless the application is placed behind an authenticated HTTPS reverse proxy.
 2. Start the console with the same virtual environment used by the scanner:
@@ -51,7 +51,7 @@ venv/bin/python webapp.py
 
 3. Open `http://127.0.0.1:8080` and sign in with the credentials from `.env`.
 
-Adding one or more targets automatically creates background scan jobs. Jobs are processed one at a time to avoid multiplying load against target infrastructure; browser requests remain responsive while scans run. Once a scan completes, its target page offers a downloadable Markdown report containing the complete normalized recon inventory. Control data is stored in `instance/control.sqlite3`, logs in `instance/logs/`, and per-job evidence under `results/web/`. A service restart preserves queued jobs and marks an interrupted running job as failed so it can be deliberately requeued.
+Creating a project with one or more domains automatically creates background scan jobs. Jobs are processed one at a time to avoid multiplying load against target infrastructure; browser requests remain responsive while scans run. Very large exact-host scope lists are uploaded in chunks by the web UI before queueing, so the final request stays small. Once a scan completes, its scope-item page offers a downloadable Markdown report containing the complete normalized recon inventory with project metadata. Control data is stored in `instance/control.sqlite3`, logs in `instance/logs/`, and per-job evidence under `results/web/`. A service restart preserves queued jobs and marks an interrupted running job as failed so it can be deliberately requeued.
 
 Every submission requires confirmation of written authorization. The default binding is local-only, sessions are HTTP-only and same-site, POST requests use CSRF tokens, scanner commands never invoke a shell, and web credentials are removed from scanner subprocess environments. For remote deployment, keep exactly one background worker (or move it into a dedicated service), place the web process behind an HTTPS reverse proxy, and set `SESSION_COOKIE_SECURE=true`.
 

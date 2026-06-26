@@ -10,7 +10,8 @@ document.addEventListener('DOMContentLoaded',()=>{
       document.querySelectorAll('[data-live-metric]').forEach(el=>el.textContent=data.totals[el.dataset.liveMetric]||0);
       data.latest.forEach(scan=>{
         document.querySelectorAll(`[data-target-id="${scan.target_id}"]`).forEach(row=>{row.dataset.status=scan.status;const badge=row.querySelector('[data-target-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}});
-        document.querySelectorAll(`[data-scan-row="${scan.id}"]`).forEach(row=>{const badge=row.querySelector('[data-scan-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}const finished=row.querySelector('[data-scan-finished]');if(finished&&scan.finished_at)finished.textContent=scan.finished_at;const action=row.querySelector('[data-scan-action]');if(action){const done=scan.status==='complete';action.href=done?action.dataset.reportUrl:action.dataset.targetUrl;action.textContent=done?'View report →':'Open target →'}});
+        document.querySelectorAll(`[data-project-id="${scan.project_id}"]`).forEach(row=>{row.dataset.status=scan.status;const badge=row.querySelector('[data-project-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}});
+        document.querySelectorAll(`[data-scan-row="${scan.id}"]`).forEach(row=>{const badge=row.querySelector('[data-scan-status]');if(badge){badge.className=`status ${scan.status}`;badge.querySelector('[data-status-text]').textContent=scan.status}const finished=row.querySelector('[data-scan-finished]');if(finished&&scan.finished_at)finished.textContent=scan.finished_at;const action=row.querySelector('[data-scan-action]');if(action){const done=scan.status==='complete';action.href=done?action.dataset.reportUrl:action.dataset.targetUrl;action.textContent=done?'View report →':'Open item →'}});
       });
       if(monitor&&data.tracked){const scan=data.tracked,status=monitor.querySelector('[data-status]'),log=monitor.querySelector('[data-log]');status.textContent=scan.status;if(scan.progress){Object.entries(scan.progress.counts||{}).forEach(([key,value])=>{const el=monitor.querySelector(`[data-progress-count="${key}"]`);if(el)el.textContent=value||0});const failures=monitor.querySelector('[data-progress-failures]');if(failures){const rows=scan.progress.failures||[];failures.hidden=!rows.length;failures.replaceChildren(...rows.map(row=>{const el=document.createElement('span');el.textContent=`${row.stage||'stage'} · ${row.tool||'tool'} · ${row.status||'failed'}`;return el}))}}if(scan.log&&log.textContent!==scan.log){log.textContent=scan.log;log.scrollTop=log.scrollHeight}if(['complete','failed','cancelled'].includes(scan.status)){stream.close();setTimeout(()=>location.reload(),500)}}
     });
@@ -31,6 +32,26 @@ document.addEventListener('DOMContentLoaded',()=>{
   document.querySelectorAll('[data-open-modal]').forEach(x=>x.addEventListener('click',()=>{modal.hidden=false;modal.querySelector('textarea')?.focus()}));
   document.querySelectorAll('[data-close-modal]').forEach(x=>x.addEventListener('click',()=>modal.hidden=true));
   modal?.addEventListener('click',e=>{if(e.target===modal)modal.hidden=true});
+  document.querySelectorAll('.target-form,.rescan').forEach(targetForm=>targetForm.addEventListener('submit',async event=>{
+    if(targetForm.dataset.uploading==='done')return;
+    const targets=targetForm.querySelector('textarea[name="targets"]'),scope=targetForm.querySelector('[data-scope-input]'),uploadId=targetForm.querySelector('[data-scope-upload-id]'),note=targetForm.querySelector('[data-scope-upload-note]'),button=targetForm.querySelector('button.primary');
+    const targetText=(targets?.value||'').trim(),scopeText=(scope?.value||'').trim();
+    if(targetForm.classList.contains('target-form')&&!targetText&&!scopeText){event.preventDefault();scope?.setCustomValidity('Enter domains or exact scoped hosts.');scope?.reportValidity();setTimeout(()=>scope?.setCustomValidity(''),0);return}
+    if(scopeText.length<=20000)return;
+    event.preventDefault();targetForm.dataset.uploading='busy';if(button)button.disabled=true;if(note){note.hidden=false;note.textContent='Preparing large scope list…'}
+    try{
+      const csrf=targetForm.querySelector('input[name="csrf_token"]')?.value||'',chunkSize=24000;let id='';
+      for(let offset=0;offset<scopeText.length;offset+=chunkSize){
+        const body=new FormData();body.append('csrf_token',csrf);if(id)body.append('upload_id',id);body.append('chunk',scopeText.slice(offset,offset+chunkSize));
+        const response=await fetch('/api/scope-upload',{method:'POST',body});
+        if(!response.ok)throw new Error(await response.text()||'Upload failed');
+        const data=await response.json();id=data.upload_id;if(note)note.textContent=`Uploaded ${Math.min(scopeText.length,offset+chunkSize).toLocaleString()} of ${scopeText.length.toLocaleString()} characters…`;
+      }
+      if(uploadId)uploadId.value=id;if(scope)scope.value='';targetForm.dataset.uploading='done';targetForm.requestSubmit();
+    }catch(error){
+      targetForm.dataset.uploading='';if(button)button.disabled=false;if(note){note.hidden=false;note.textContent='Large scope upload failed. Try a smaller batch.'}console.error(error);
+    }
+  }));
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal)modal.hidden=true});
   document.querySelector('[data-menu]')?.addEventListener('click',()=>document.querySelector('.sidebar')?.classList.toggle('open'));
   document.querySelectorAll('[data-rate]').forEach(x=>x.addEventListener('click',()=>{const input=document.querySelector('input[name="request_rate"]');if(input)input.value=x.dataset.rate}));

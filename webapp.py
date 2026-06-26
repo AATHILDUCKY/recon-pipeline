@@ -24,10 +24,13 @@ from typing import Any, Callable
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 from markupsafe import Markup, escape
 
-from recon_pipeline import canonical_domain, canonical_scope_subdomain, redact_url
+from recon_pipeline import canonical_domain, canonical_scope_subdomain, redact_url, scope_entry_host
 
 BASE_DIR = Path(__file__).resolve().parent
 ACTIVE_STATUSES = ("queued", "running")
+TARGET_WITH_LATEST_SQL = """SELECT t.*,p.name project_name,s.id scan_id,s.profile,s.status,s.created_at scan_created,
+              s.started_at,s.finished_at,s.error FROM targets t LEFT JOIN projects p ON p.id=t.project_id
+              LEFT JOIN scans s ON s.id=(SELECT id FROM scans WHERE target_id=t.id ORDER BY id DESC LIMIT 1)"""
 
 
 def load_env(path: Path) -> None:
@@ -64,22 +67,76 @@ SCAN_STAGE_CHOICES = (
 )
 
 
-def selected_scan_options(form: Any, domain: str) -> tuple[str, str]:
+def scope_upload_dir(app: Flask) -> Path:
+    path = Path(app.config["SCOPE_UPLOAD_DIR"])
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def scope_upload_path(app: Flask, upload_id: str) -> Path | None:
+    if not re.fullmatch(r"[a-f0-9]{32}", upload_id or ""):
+        return None
+    path = (scope_upload_dir(app) / f"{upload_id}.txt").resolve()
+    try:
+        path.relative_to(scope_upload_dir(app).resolve())
+    except ValueError:
+        return None
+    return path
+
+
+def read_scope_upload(app: Flask, upload_id: str) -> str:
+    path = scope_upload_path(app, upload_id)
+    if not path or not path.is_file():
+        return ""
+    if path.stat().st_size > app.config["MAX_SCOPE_UPLOAD_BYTES"]:
+        raise ValueError("Scope list is too large for one submission.")
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def scope_entries(raw_scope: str) -> list[str]:
+    return [value.strip() for value in re.split(r"[\s,]+", raw_scope) if value.strip()]
+
+
+def selected_scan_options(form: Any, domain: str, raw_scope: str | None = None) -> tuple[str, str]:
     enabled=set(form.getlist("stages")) if hasattr(form,"getlist") else set()
     if not enabled and str(form.get("stage_policy","")) != "1":
         enabled={key for key,_ in SCAN_STAGE_CHOICES}
     valid={key for key,_ in SCAN_STAGE_CHOICES}
     skip_stages=sorted(valid-enabled)
-    raw_scope=str(form.get("scope_subdomains",""))
+    raw_scope=str(form.get("scope_subdomains","") if raw_scope is None else raw_scope)
     subdomains=[]
     invalid=[]
-    for value in re.split(r"[\s,]+",raw_scope):
-        if not value.strip():continue
+    for value in scope_entries(raw_scope):
         try:subdomains.append(canonical_scope_subdomain(value,domain))
         except ValueError:invalid.append(value[:80])
     if invalid:
         raise ValueError(f"Invalid/out-of-scope subdomain(s): {', '.join(invalid[:5])}")
     return ",".join(skip_stages), "\n".join(dict.fromkeys(subdomains))
+
+
+def scope_only_targets(raw_scope: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Turn an exact host list into independent scoped scans."""
+    targets: list[tuple[str, str]] = []
+    invalid: list[str] = []
+    for value in scope_entries(raw_scope):
+        host = scope_entry_host(value)
+        host = host.split("*", 1)[0] if "*" in host else host
+        host = host.strip(".")
+        try:
+            domain = canonical_domain(host if host else value)
+            scoped = canonical_scope_subdomain(value, domain)
+        except ValueError:
+            invalid.append(value[:80]); continue
+        if "*" in scoped:
+            invalid.append(value[:80]); continue
+        targets.append((domain, scoped))
+    deduped = list(dict.fromkeys(targets))
+    return deduped, invalid
+
+
+def project_name(value: str, fallback: str = "Deep analysis") -> str:
+    name = re.sub(r"\s+", " ", str(value or "").strip())
+    return (name or fallback)[:120]
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -95,8 +152,13 @@ def init_db(path: Path) -> None:
     with connect_db(path) as db:
         db.executescript("""
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS projects (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS targets (
           id INTEGER PRIMARY KEY, domain TEXT NOT NULL UNIQUE,
+          project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
           request_rate INTEGER NOT NULL DEFAULT 30 CHECK(request_rate BETWEEN 1 AND 500),
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -114,8 +176,16 @@ def init_db(path: Path) -> None:
         CREATE INDEX IF NOT EXISTS scans_status_created ON scans(status, id);
         """)
         columns = {row["name"] for row in db.execute("PRAGMA table_info(targets)")}
+        if "project_id" not in columns:
+            db.execute("ALTER TABLE targets ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL")
         if "request_rate" not in columns:
             db.execute("ALTER TABLE targets ADD COLUMN request_rate INTEGER NOT NULL DEFAULT 30")
+        db.execute("INSERT OR IGNORE INTO projects(name) VALUES('Deep analysis')")
+        default_project = db.execute("SELECT id FROM projects WHERE name='Deep analysis'").fetchone()["id"]
+        for row in db.execute("SELECT id,domain FROM targets WHERE project_id IS NULL").fetchall():
+            db.execute("INSERT OR IGNORE INTO projects(name) VALUES(?)", (row["domain"],))
+            project = db.execute("SELECT id FROM projects WHERE name=?", (row["domain"],)).fetchone()
+            db.execute("UPDATE targets SET project_id=? WHERE id=?", ((project["id"] if project else default_project), row["id"]))
         scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scans)")}
         if "request_rate" not in scan_columns:
             db.execute("ALTER TABLE scans ADD COLUMN request_rate INTEGER")
@@ -258,6 +328,28 @@ def parse_technologies(value: Any, server: str = "") -> list[str]:
 def technology_version(label: str) -> str:
     match=re.search(r"(?:[:/]\s*|\bv)(\d+(?:[._-]\d+)*(?:[a-z0-9._-]*))",label,re.I)
     return match.group(1) if match else ""
+
+
+def project_summaries(db: sqlite3.Connection, project_id: int | None = None) -> list[dict[str, Any]]:
+    db.execute("INSERT OR IGNORE INTO projects(name) VALUES('Deep analysis')")
+    default_project = db.execute("SELECT id FROM projects WHERE name='Deep analysis'").fetchone()["id"]
+    db.execute("UPDATE targets SET project_id=? WHERE project_id IS NULL", (default_project,))
+    where = "WHERE p.id=?" if project_id else ""
+    args = (project_id,) if project_id else ()
+    projects = [dict(row) for row in db.execute(f"SELECT p.* FROM projects p {where} ORDER BY p.id DESC", args)]
+    for project in projects:
+        targets = [dict(row) for row in db.execute(TARGET_WITH_LATEST_SQL + " WHERE t.project_id=? ORDER BY t.domain", (project["id"],))]
+        statuses = [row.get("status") for row in targets if row.get("status")]
+        latest_activity = max((row.get("finished_at") or row.get("started_at") or row.get("scan_created") or row.get("created_at") or "" for row in targets), default="")
+        project.update({
+            "targets": targets,
+            "domain_count": len(targets),
+            "scan_count": sum(1 for row in targets if row.get("scan_id")),
+            "active_count": sum(1 for row in targets if row.get("status") in ACTIVE_STATUSES),
+            "latest_activity": latest_activity,
+            "status": "running" if "running" in statuses else ("queued" if "queued" in statuses else (statuses[0] if statuses else "")),
+        })
+    return projects
 
 
 def relevant_technology_findings(label: str, findings: list[dict[str,Any]]) -> list[dict[str,Any]]:
@@ -439,7 +531,7 @@ def markdown_table(rows: list[sqlite3.Row]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_markdown_report(app: Flask, stored_dir: str | None, scan: sqlite3.Row, domain: str) -> str | None:
+def build_markdown_report(app: Flask, stored_dir: str | None, scan: sqlite3.Row, domain: str, project: str = "") -> str | None:
     """Build a complete, portable report from a completed scan database."""
     db_path = result_database(app, stored_dir)
     if not db_path:
@@ -464,10 +556,10 @@ def build_markdown_report(app: Flask, stored_dir: str | None, scan: sqlite3.Row,
 
     generated = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     lines = [
-        f"# Reconnaissance report: {domain}", "",
+        f"# Reconnaissance report: {project or domain}", "",
         "> Authorized attack-surface inventory. Automated observations require manual validation.", "",
         "## Scan details", "",
-        f"- **Target:** {markdown_cell(domain)}", f"- **Scan ID:** {scan['id']}",
+        f"- **Project:** {markdown_cell(project or '—')}", f"- **Scope item:** {markdown_cell(domain)}", f"- **Scan ID:** {scan['id']}",
         f"- **Profile:** {markdown_cell(run['profile'])}", f"- **Status:** {markdown_cell(run['status'])}",
         f"- **Started:** {markdown_cell(run['started_at'])}",
         f"- **Finished:** {markdown_cell(run['finished_at'] or scan['finished_at'])}",
@@ -571,6 +663,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
         DEFAULT_SCAN_PROFILE=os.getenv("DEFAULT_SCAN_PROFILE", "standard"),
         SCAN_RATE=int(os.getenv("SCAN_RATE", "30")), SCAN_CONCURRENCY=int(os.getenv("SCAN_CONCURRENCY", "15")),
         SCAN_ACTIVE_DELAY=float(os.getenv("SCAN_ACTIVE_DELAY", "1.0")),
+        SCOPE_UPLOAD_DIR=str(instance / "scope-uploads"), MAX_SCOPE_UPLOAD_BYTES=10 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=truthy(os.getenv("SESSION_COOKIE_SECURE", "false")),
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8), MAX_CONTENT_LENGTH=64 * 1024,
@@ -582,7 +675,8 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @app.before_request
     def csrf_guard() -> None:
         session.setdefault("csrf_token", secrets.token_urlsafe(32))
-        if request.method == "POST" and not hmac.compare_digest(session["csrf_token"], request.form.get("csrf_token", "")):
+        token = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
+        if request.method == "POST" and not hmac.compare_digest(session["csrf_token"], token):
             abort(400, "Invalid or missing CSRF token")
 
     @app.context_processor
@@ -621,26 +715,34 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def dashboard() -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            targets = db.execute("""SELECT t.*,s.id scan_id,s.profile,s.status,s.created_at scan_created,
-              s.started_at,s.finished_at,s.error FROM targets t LEFT JOIN scans s ON s.id=(SELECT id FROM scans WHERE target_id=t.id ORDER BY id DESC LIMIT 1)
-              ORDER BY t.id DESC""").fetchall()
+            projects = project_summaries(db)
             totals = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM scans GROUP BY status")}
-        return render_template("dashboard.html", targets=targets, totals=totals)
+        return render_template("dashboard.html", projects=projects, totals=totals)
 
     @app.get("/targets")
     @login_required
     def targets_index() -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            targets = db.execute("""SELECT t.*,s.id scan_id,s.profile,s.status,s.created_at scan_created,
-              s.started_at,s.finished_at,s.error FROM targets t LEFT JOIN scans s ON s.id=(SELECT id FROM scans WHERE target_id=t.id ORDER BY id DESC LIMIT 1)
-              ORDER BY t.domain""").fetchall()
-        return render_template("targets.html", targets=targets)
+            projects = project_summaries(db)
+        return render_template("targets.html", projects=projects)
+
+    @app.get("/projects/<int:project_id>")
+    @login_required
+    def project_detail(project_id: int) -> Any:
+        with connect_db(Path(app.config["CONTROL_DB"])) as db:
+            projects = project_summaries(db, project_id)
+            if not projects: abort(404)
+            project = projects[0]
+            scans = db.execute("""SELECT s.*,t.domain,COALESCE(s.request_rate,t.request_rate) AS effective_rate FROM scans s JOIN targets t ON t.id=s.target_id
+                                WHERE t.project_id=? ORDER BY CASE s.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,s.id DESC LIMIT 300""",
+                               (project_id,)).fetchall()
+        return render_template("project.html", project=project, scans=scans)
 
     @app.get("/scans")
     @login_required
     def scan_activity() -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            scans = db.execute("""SELECT s.*,t.domain,COALESCE(s.request_rate,t.request_rate) AS effective_rate FROM scans s JOIN targets t ON t.id=s.target_id
+            scans = db.execute("""SELECT s.*,t.domain,p.name project_name,COALESCE(s.request_rate,t.request_rate) AS effective_rate FROM scans s JOIN targets t ON t.id=s.target_id LEFT JOIN projects p ON p.id=t.project_id
                                 ORDER BY CASE s.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,s.id DESC LIMIT 300""").fetchall()
             totals = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM scans GROUP BY status")}
         return render_template("scans.html", scans=scans, totals=totals)
@@ -649,7 +751,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def attack_surface() -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            snapshots = db.execute("""SELECT s.*,t.domain FROM scans s JOIN targets t ON t.id=s.target_id
+            snapshots = db.execute("""SELECT s.*,t.domain,p.name project_name FROM scans s JOIN targets t ON t.id=s.target_id LEFT JOIN projects p ON p.id=t.project_id
               WHERE s.status='complete' AND s.id=(SELECT id FROM scans WHERE target_id=t.id AND status='complete' ORDER BY id DESC LIMIT 1)
               ORDER BY s.finished_at DESC""").fetchall()
             prepared = []
@@ -673,7 +775,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
                 key = "hostname" if field == "subdomains" else "url"
                 for row in results[field]:
                     if row.get("is_new"):
-                        changes.append({"kind": kind, "value": row.get(key), "domain": scan["domain"],
+                        changes.append({"kind": kind, "value": row.get(key), "domain": scan["domain"], "project": scan["project_name"] or scan["domain"],
                                         "target_id": scan["target_id"], "scan_id": scan["id"]})
         return render_template("attack_surface.html", totals=totals, targets=targets, changes=changes[:100])
 
@@ -681,7 +783,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def reports() -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            scans = db.execute("""SELECT s.*,t.domain FROM scans s JOIN targets t ON t.id=s.target_id
+            scans = db.execute("""SELECT s.*,t.domain,p.name project_name FROM scans s JOIN targets t ON t.id=s.target_id LEFT JOIN projects p ON p.id=t.project_id
                                 WHERE s.status='complete' ORDER BY s.id DESC LIMIT 300""").fetchall()
         return render_template("reports.html", scans=scans)
 
@@ -689,7 +791,7 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def scan_report(scan_id: int) -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            scan = db.execute("SELECT s.*,t.domain,COALESCE(s.request_rate,t.request_rate) AS effective_rate FROM scans s JOIN targets t ON t.id=s.target_id WHERE s.id=? AND s.status='complete'", (scan_id,)).fetchone()
+            scan = db.execute("SELECT s.*,t.domain,p.name project_name,COALESCE(s.request_rate,t.request_rate) AS effective_rate FROM scans s JOIN targets t ON t.id=s.target_id LEFT JOIN projects p ON p.id=t.project_id WHERE s.id=? AND s.status='complete'", (scan_id,)).fetchone()
             if not scan: abort(404)
             previous = db.execute("SELECT result_dir FROM scans WHERE target_id=? AND status='complete' AND id<? ORDER BY id DESC LIMIT 1",
                                   (scan["target_id"], scan["id"])).fetchone()
@@ -700,9 +802,9 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def download_scan_markdown(scan_id: int) -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            scan = db.execute("SELECT s.*,t.domain FROM scans s JOIN targets t ON t.id=s.target_id WHERE s.id=? AND s.status='complete'", (scan_id,)).fetchone()
+            scan = db.execute("SELECT s.*,t.domain,p.name project_name FROM scans s JOIN targets t ON t.id=s.target_id LEFT JOIN projects p ON p.id=t.project_id WHERE s.id=? AND s.status='complete'", (scan_id,)).fetchone()
         if not scan: abort(404)
-        report = build_markdown_report(app, scan["result_dir"], scan, scan["domain"])
+        report = build_markdown_report(app, scan["result_dir"], scan, scan["domain"], scan["project_name"] if "project_name" in scan.keys() else "")
         if report is None: abort(404, "Completed scan results are unavailable")
         response = Response(report, content_type="text/markdown; charset=utf-8")
         response.headers["Content-Disposition"] = f'attachment; filename="{scan["domain"]}-recon-scan-{scan["id"]}.md"'
@@ -715,6 +817,12 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
         if request.form.get("authorized") != "yes":
             flash("Confirm written authorization before scheduling a scan.", "error"); return redirect(url_for("dashboard"))
         raw = request.form.get("targets", "")
+        name = project_name(request.form.get("project_name", ""))
+        scope_upload_id = request.form.get("scope_upload_id", "")
+        try:
+            raw_scope = read_scope_upload(app, scope_upload_id) if scope_upload_id else str(request.form.get("scope_subdomains", ""))
+        except ValueError as exc:
+            flash(str(exc), "error"); return redirect(url_for("dashboard"))
         profile = request.form.get("profile", app.config["DEFAULT_SCAN_PROFILE"])
         if profile not in {"passive", "standard", "deep"}: abort(400)
         try:
@@ -731,27 +839,69 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
         domains = list(dict.fromkeys(domains))
         queued = 0
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            for domain in domains:
-                try:
-                    skip_stages, scope_subdomains = selected_scan_options(request.form, domain)
-                except ValueError as exc:
-                    flash(str(exc), "error")
-                    continue
-                db.execute("INSERT OR IGNORE INTO targets(domain,request_rate) VALUES(?,?)", (domain, request_rate))
-                target_id = db.execute("SELECT id FROM targets WHERE domain=?", (domain,)).fetchone()["id"]
-                active = db.execute("SELECT 1 FROM scans WHERE target_id=? AND status IN ('queued','running')", (target_id,)).fetchone()
-                if not active:
-                    db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains)); queued += 1
-        if queued: flash(f"Queued {queued} authorized target scan(s).", "success")
+            if domains:
+                db.execute("INSERT OR IGNORE INTO projects(name) VALUES(?)", (name,))
+                project_id = db.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()["id"]
+                for domain in domains:
+                    try:
+                        skip_stages, scope_subdomains = selected_scan_options(request.form, domain, raw_scope)
+                    except ValueError as exc:
+                        flash(str(exc), "error")
+                        continue
+                    db.execute("INSERT OR IGNORE INTO targets(domain,project_id,request_rate) VALUES(?,?,?)", (domain, project_id, request_rate))
+                    db.execute("UPDATE targets SET project_id=?,request_rate=? WHERE domain=?", (project_id, request_rate, domain))
+                    target_id = db.execute("SELECT id FROM targets WHERE domain=?", (domain,)).fetchone()["id"]
+                    active = db.execute("SELECT 1 FROM scans WHERE target_id=? AND status IN ('queued','running')", (target_id,)).fetchone()
+                    if not active:
+                        db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains)); queued += 1
+            elif raw_scope.strip():
+                db.execute("INSERT OR IGNORE INTO projects(name) VALUES(?)", (name,))
+                project_id = db.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()["id"]
+                skip_stages, _ = selected_scan_options(request.form, "example.com", "")
+                scoped_targets, scope_invalid = scope_only_targets(raw_scope)
+                invalid.extend(scope_invalid)
+                for domain, scope_subdomains in scoped_targets[:5000]:
+                    db.execute("INSERT OR IGNORE INTO targets(domain,project_id,request_rate) VALUES(?,?,?)", (domain, project_id, request_rate))
+                    db.execute("UPDATE targets SET project_id=?,request_rate=? WHERE domain=?", (project_id, request_rate, domain))
+                    target_id = db.execute("SELECT id FROM targets WHERE domain=?", (domain,)).fetchone()["id"]
+                    active = db.execute("SELECT 1 FROM scans WHERE target_id=? AND status IN ('queued','running')", (target_id,)).fetchone()
+                    if not active:
+                        db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains)); queued += 1
+                if len(scoped_targets) > 5000:
+                    flash("Queued the first 5000 scoped hosts; submit the remaining hosts as another batch.", "info")
+        upload_path = scope_upload_path(app, scope_upload_id) if scope_upload_id else None
+        if upload_path and upload_path.is_file():
+            try: upload_path.unlink()
+            except OSError: pass
+        if queued: flash(f"Queued {queued} scan(s) for {name}.", "success")
         if invalid: flash(f"Skipped {len(invalid)} invalid target(s).", "error")
-        if not queued and not invalid: flash("No new scans were queued; these targets may already be active.", "info")
+        if not queued and not invalid: flash("No new scans were queued; provide domains or exact scoped hosts, or these targets may already be active.", "info")
         return redirect(url_for("dashboard"))
+
+    @app.post("/api/scope-upload")
+    @login_required
+    def scope_upload() -> Any:
+        upload_id = request.form.get("upload_id") or secrets.token_hex(16)
+        path = scope_upload_path(app, upload_id)
+        if not path: abort(400, "Invalid upload id")
+        chunk = request.form.get("chunk", "")
+        if not chunk: abort(400, "Empty upload chunk")
+        if len(chunk.encode("utf-8", "replace")) > 48 * 1024:
+            abort(413, "Upload chunk is too large")
+        mode = "ab" if path.exists() else "wb"
+        with path.open(mode) as handle:
+            handle.write(chunk.encode("utf-8", "replace"))
+        if path.stat().st_size > app.config["MAX_SCOPE_UPLOAD_BYTES"]:
+            try: path.unlink()
+            except OSError: pass
+            abort(413, "Scope list is too large")
+        return jsonify(upload_id=upload_id, bytes=path.stat().st_size)
 
     @app.get("/targets/<int:target_id>")
     @login_required
     def target_detail(target_id: int) -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            target = db.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+            target = db.execute("SELECT t.*,p.name project_name FROM targets t LEFT JOIN projects p ON p.id=t.project_id WHERE t.id=?", (target_id,)).fetchone()
             if not target: abort(404)
             scans = db.execute("SELECT * FROM scans WHERE target_id=? ORDER BY id DESC LIMIT 30", (target_id,)).fetchall()
             active_scan = db.execute("SELECT * FROM scans WHERE target_id=? AND status IN ('queued','running') ORDER BY id LIMIT 1", (target_id,)).fetchone()
@@ -782,13 +932,13 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
     @login_required
     def download_markdown_report(target_id: int) -> Any:
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
-            target = db.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
+            target = db.execute("SELECT t.*,p.name project_name FROM targets t LEFT JOIN projects p ON p.id=t.project_id WHERE t.id=?", (target_id,)).fetchone()
             if not target:
                 abort(404)
             scan = db.execute("SELECT * FROM scans WHERE target_id=? AND status='complete' ORDER BY id DESC LIMIT 1", (target_id,)).fetchone()
         if not scan:
             abort(404, "No completed scan is available")
-        report = build_markdown_report(app, scan["result_dir"], scan, target["domain"])
+        report = build_markdown_report(app, scan["result_dir"], scan, target["domain"], target["project_name"] if "project_name" in target.keys() else "")
         if report is None:
             abort(404, "Completed scan results are unavailable")
         response = Response(report, content_type="text/markdown; charset=utf-8")
@@ -808,11 +958,17 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             abort(400, "Request rate must be a number")
         if not 1 <= request_rate <= 500:
             abort(400, "Request rate must be between 1 and 500")
+        scope_upload_id = request.form.get("scope_upload_id", "")
+        try:
+            raw_scope = read_scope_upload(app, scope_upload_id) if scope_upload_id else str(request.form.get("scope_subdomains", ""))
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("target_detail", target_id=target_id))
         with connect_db(Path(app.config["CONTROL_DB"])) as db:
             target = db.execute("SELECT * FROM targets WHERE id=?", (target_id,)).fetchone()
             if not target: abort(404)
             try:
-                skip_stages, scope_subdomains = selected_scan_options(request.form, str(target["domain"]))
+                skip_stages, scope_subdomains = selected_scan_options(request.form, str(target["domain"]), raw_scope)
             except ValueError as exc:
                 flash(str(exc), "error")
                 return redirect(url_for("target_detail", target_id=target_id))
@@ -822,6 +978,10 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
                 db.execute("UPDATE targets SET request_rate=? WHERE id=?", (request_rate, target_id))
                 db.execute("INSERT INTO scans(target_id,profile,request_rate,skip_stages,scope_subdomains,status) VALUES(?,?,?,?,?,'queued')", (target_id, profile, request_rate, skip_stages, scope_subdomains))
                 flash(f"Scan queued at {request_rate} requests per second.", "success")
+        upload_path = scope_upload_path(app, scope_upload_id) if scope_upload_id else None
+        if upload_path and upload_path.is_file():
+            try: upload_path.unlink()
+            except OSError: pass
         return redirect(url_for("target_detail", target_id=target_id))
 
     @app.post("/scans/<int:scan_id>/delete")
@@ -872,8 +1032,8 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             while True:
                 with connect_db(Path(app.config["CONTROL_DB"])) as db:
                     totals = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM scans GROUP BY status")}
-                    latest = [dict(row) for row in db.execute("""SELECT s.id,s.target_id,s.status,s.profile,s.request_rate,s.started_at,s.finished_at,s.error
-                      FROM scans s WHERE s.id=(SELECT id FROM scans WHERE target_id=s.target_id ORDER BY id DESC LIMIT 1) ORDER BY s.id DESC""")]
+                    latest = [dict(row) for row in db.execute("""SELECT s.id,s.target_id,t.project_id,s.status,s.profile,s.request_rate,s.started_at,s.finished_at,s.error
+                      FROM scans s JOIN targets t ON t.id=s.target_id WHERE s.id=(SELECT id FROM scans WHERE target_id=s.target_id ORDER BY id DESC LIMIT 1) ORDER BY s.id DESC""")]
                     tracked = None
                     if tracked_scan:
                         row = db.execute("SELECT id,target_id,status,profile,request_rate,started_at,finished_at,result_dir,log_path,error,exit_code FROM scans WHERE id=?", (tracked_scan,)).fetchone()

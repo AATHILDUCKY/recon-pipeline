@@ -297,6 +297,50 @@ class WebApplicationTests(unittest.TestCase):
         with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
             self.assertEqual(control.execute("SELECT COUNT(*) FROM scans WHERE id=?", (scan_id,)).fetchone()[0], 1)
 
+    def test_project_stop_cancels_queued_and_running_scans(self):
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            project_id = control.execute("INSERT INTO projects(name) VALUES(?)", ("Stop me",)).lastrowid
+            running_target = control.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", ("run.stop.example", project_id)).lastrowid
+            queued_target = control.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", ("queue.stop.example", project_id)).lastrowid
+            done_target = control.execute("INSERT INTO targets(domain,project_id) VALUES(?,?)", ("done.stop.example", project_id)).lastrowid
+            control.execute("INSERT INTO scans(target_id,profile,status) VALUES(?,?,'running')", (running_target, "standard"))
+            control.execute("INSERT INTO scans(target_id,profile,status) VALUES(?,?,'queued')", (queued_target, "standard"))
+            control.execute("INSERT INTO scans(target_id,profile,status) VALUES(?,?,'complete')", (done_target, "standard"))
+        self.login()
+        with self.client.session_transaction() as session: token = session["csrf_token"]
+        response = self.client.post(f"/projects/{project_id}/stop", data={"csrf_token": token})
+        self.assertEqual(response.status_code, 302)
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            statuses = sorted(row[0] for row in control.execute("SELECT status FROM scans"))
+            self.assertEqual(statuses, ["cancelled", "cancelled", "complete"])
+
+    def test_project_delete_removes_targets_scans_and_result_folders(self):
+        result_root = Path(self.app.config["RESULTS_DIR"]) / "target-99"
+        result = result_root / "scan-7" / "run"
+        log = Path(self.app.config["LOG_DIR"]) / "scan-7.log"
+        result.mkdir(parents=True)
+        log.parent.mkdir(parents=True)
+        (result / "recon.sqlite3").write_text("artifact")
+        (result_root / "orphan.tmp").write_text("partial")
+        log.write_text("log")
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            project_id = control.execute("INSERT INTO projects(name) VALUES(?)", ("Delete me",)).lastrowid
+            target_id = control.execute("INSERT INTO targets(id,domain,project_id) VALUES(?,?,?)", (99, "delete-project.example", project_id)).lastrowid
+            control.execute("""INSERT INTO scans(id,target_id,profile,status,result_dir,log_path)
+                            VALUES(?,?,?,?,?,?)""", (7, target_id, "standard", "complete", str(result), str(log)))
+            control.execute("INSERT INTO scans(target_id,profile,status) VALUES(?,?,'queued')", (target_id, "standard"))
+        self.login()
+        with self.client.session_transaction() as session: token = session["csrf_token"]
+        response = self.client.post(f"/projects/{project_id}/delete", data={"csrf_token": token})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+        self.assertFalse(result_root.exists())
+        self.assertFalse(log.exists())
+        with sqlite3.connect(self.app.config["CONTROL_DB"]) as control:
+            self.assertEqual(control.execute("SELECT COUNT(*) FROM projects WHERE id=?", (project_id,)).fetchone()[0], 0)
+            self.assertEqual(control.execute("SELECT COUNT(*) FROM targets WHERE project_id=?", (project_id,)).fetchone()[0], 0)
+            self.assertEqual(control.execute("SELECT COUNT(*) FROM scans").fetchone()[0], 0)
+
     def test_new_assets_are_compared_with_previous_scan(self):
         previous = Path(self.tmp.name) / "results" / "previous"
         current = Path(self.tmp.name) / "results" / "current"

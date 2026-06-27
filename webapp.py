@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -251,6 +252,37 @@ def scoped_path(candidate: str | None, root: str) -> Path | None:
     except ValueError:
         return None
     return path if relative.parts else None
+
+
+def scoped_child(root: str, *parts: str) -> Path:
+    path = (Path(root).resolve().joinpath(*parts)).resolve()
+    path.relative_to(Path(root).resolve())
+    return path
+
+
+def scan_artifact_paths(app: Flask, scans: list[sqlite3.Row]) -> list[Path]:
+    paths: list[Path] = []
+    for scan in scans:
+        result_path = scoped_path(scan["result_dir"] if "result_dir" in scan.keys() else None, app.config["RESULTS_DIR"])
+        log_path = scoped_path(scan["log_path"] if "log_path" in scan.keys() else None, app.config["LOG_DIR"])
+        if result_path:
+            paths.append(result_path)
+        if log_path:
+            paths.append(log_path)
+    return paths
+
+
+def cleanup_paths(paths: list[Path]) -> bool:
+    ok = True
+    for path in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.is_file():
+                path.unlink()
+        except OSError:
+            ok = False
+    return ok
 
 
 def result_inventory(app: Flask, stored_dir: str | None) -> dict[str, set[str]]:
@@ -592,6 +624,8 @@ class ScanWorker:
         self.app = app
         self.stop_event = threading.Event()
         self.process: subprocess.Popen[str] | None = None
+        self.current_scan_id: int | None = None
+        self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.run, name="recon-worker", daemon=True)
 
     def start(self) -> None:
@@ -599,6 +633,21 @@ class ScanWorker:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.cancel_current()
+
+    def cancel_current(self, scan_ids: set[int] | None = None) -> bool:
+        with self.lock:
+            process = self.process
+            current_scan_id = self.current_scan_id
+            if not process or process.poll() is not None:
+                return False
+            if scan_ids is not None and current_scan_id not in scan_ids:
+                return False
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                process.terminate()
+            return True
 
     def claim(self) -> sqlite3.Row | None:
         with connect_db(Path(self.app.config["CONTROL_DB"])) as db:
@@ -639,19 +688,35 @@ class ScanWorker:
         exit_code = -1; error = None
         try:
             with log_path.open("w", encoding="utf-8", errors="replace") as log:
-                self.process = subprocess.Popen(self.command(row, output), cwd=BASE_DIR, stdout=log,
-                                                stderr=subprocess.STDOUT, text=True, env=child_env, start_new_session=True)
-                while self.process.poll() is None and not self.stop_event.wait(0.5): pass
-                if self.process.poll() is None:
-                    self.process.terminate()
-                exit_code = self.process.wait(timeout=15)
+                process = subprocess.Popen(self.command(row, output), cwd=BASE_DIR, stdout=log,
+                                           stderr=subprocess.STDOUT, text=True, env=child_env, start_new_session=True)
+                with self.lock:
+                    self.process = process
+                    self.current_scan_id = int(row["id"])
+                while process.poll() is None and not self.stop_event.wait(0.5):
+                    pass
+                if process.poll() is None:
+                    self.cancel_current({int(row["id"])})
+                try:
+                    exit_code = process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        process.kill()
+                    exit_code = process.wait(timeout=5)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:500]
         finally:
-            self.process = None
+            with self.lock:
+                self.process = None
+                self.current_scan_id = None
         databases = sorted(output.glob("*/recon.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
         result_dir = str(databases[0].parent) if databases else None
-        status = "complete" if exit_code == 0 and result_dir else "failed"
+        with connect_db(Path(self.app.config["CONTROL_DB"])) as db:
+            current = db.execute("SELECT status FROM scans WHERE id=?", (row["id"],)).fetchone()
+        cancelled = bool(current and current["status"] == "cancelled")
+        status = "cancelled" if cancelled else ("complete" if exit_code == 0 and result_dir else "failed")
         if status == "failed" and not error:
             error = f"scanner exited with code {exit_code}" if exit_code != 0 else "scanner produced no result database"
         with connect_db(Path(self.app.config["CONTROL_DB"])) as db:
@@ -751,6 +816,56 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
                                 WHERE t.project_id=? ORDER BY CASE s.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,s.id DESC LIMIT 300""",
                                (project_id,)).fetchall()
         return render_template("project.html", project=project, scans=scans)
+
+    @app.post("/projects/<int:project_id>/stop")
+    @login_required
+    def stop_project(project_id: int) -> Any:
+        with connect_db(Path(app.config["CONTROL_DB"])) as db:
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                abort(404)
+            active = db.execute("""SELECT s.id FROM scans s JOIN targets t ON t.id=s.target_id
+                                WHERE t.project_id=? AND s.status IN ('queued','running')""", (project_id,)).fetchall()
+            scan_ids = {int(row["id"]) for row in active}
+            if scan_ids:
+                placeholders = ",".join("?" for _ in scan_ids)
+                db.execute(f"""UPDATE scans SET status='cancelled',finished_at=CURRENT_TIMESTAMP,
+                           error='Cancelled by project stop request' WHERE id IN ({placeholders})""", tuple(scan_ids))
+        worker = app.extensions.get("scan_worker")
+        if worker and scan_ids:
+            worker.cancel_current(scan_ids)
+        flash(f"Stopped {len(scan_ids)} active scan(s)." if scan_ids else "No active scans were running for this project.", "info")
+        return redirect(url_for("project_detail", project_id=project_id))
+
+    @app.post("/projects/<int:project_id>/delete")
+    @login_required
+    def delete_project(project_id: int) -> Any:
+        with connect_db(Path(app.config["CONTROL_DB"])) as db:
+            project = db.execute("SELECT id,name FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not project:
+                abort(404)
+            scans = db.execute("""SELECT s.id,s.status,s.result_dir,s.log_path FROM scans s JOIN targets t ON t.id=s.target_id
+                                WHERE t.project_id=?""", (project_id,)).fetchall()
+            targets = db.execute("SELECT id FROM targets WHERE project_id=?", (project_id,)).fetchall()
+            scan_ids = {int(row["id"]) for row in scans}
+            active_ids = {int(row["id"]) for row in scans if row["status"] in ACTIVE_STATUSES}
+            artifact_paths = scan_artifact_paths(app, scans)
+            for target in targets:
+                artifact_paths.append(scoped_child(app.config["RESULTS_DIR"], f"target-{target['id']}"))
+            if active_ids:
+                placeholders = ",".join("?" for _ in active_ids)
+                db.execute(f"""UPDATE scans SET status='cancelled',finished_at=CURRENT_TIMESTAMP,
+                           error='Cancelled by project delete request' WHERE id IN ({placeholders})""", tuple(active_ids))
+            db.execute("DELETE FROM targets WHERE project_id=?", (project_id,))
+            db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        worker = app.extensions.get("scan_worker")
+        if worker and active_ids:
+            worker.cancel_current(active_ids)
+        cleaned = cleanup_paths(artifact_paths)
+        if cleaned:
+            flash(f"Project {project['name']} was deleted with {len(scan_ids)} scan record(s) and result folders.", "success")
+        else:
+            flash(f"Project {project['name']} was deleted, but one or more artifacts could not be removed.", "info")
+        return redirect(url_for("dashboard"))
 
     @app.get("/scans")
     @login_required
@@ -1007,16 +1122,9 @@ def create_app(config: dict[str, Any] | None = None, *, start_worker: bool = Tru
             if scan["status"] == "running":
                 flash("A running scan cannot be deleted. Wait for it to finish before removing it.", "error")
                 return redirect(safe_next(request.form.get("next")))
-            result_path = scoped_path(scan["result_dir"], app.config["RESULTS_DIR"])
-            log_path = scoped_path(scan["log_path"], app.config["LOG_DIR"])
+            artifact_paths = scan_artifact_paths(app, [scan])
             db.execute("DELETE FROM scans WHERE id=?", (scan_id,))
-        cleanup_failed = False
-        try:
-            if result_path and result_path.is_dir(): shutil.rmtree(result_path)
-            if log_path and log_path.is_file(): log_path.unlink()
-        except OSError:
-            cleanup_failed = True
-        if cleanup_failed:
+        if not cleanup_paths(artifact_paths):
             flash(f"Scan #{scan_id} was removed, but one artifact could not be cleaned up.", "info")
         else:
             flash(f"Scan #{scan_id} and its stored artifacts were deleted.", "success")
